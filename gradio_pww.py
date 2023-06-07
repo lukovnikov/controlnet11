@@ -413,7 +413,7 @@ def get_cond(prompt, spec, num_samples, method="Ediffi", model=None):
 
 
 def process(method, inpfile, segmap, prompt, num_samples, image_resolution, detect_resolution, ddim_steps, guess_mode, strength, scale, seed, eta):
-    print(f"Loading tools...")
+    print(f"Loading tools..")
     model, sampler = create_tools()
     print(f"Tools loaded.")
     
