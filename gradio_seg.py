@@ -26,27 +26,27 @@ model = model.cuda()
 ddim_sampler = DDIMSampler(model)
 
 
-def process(det, input_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, detect_resolution, ddim_steps, guess_mode, strength, scale, seed, eta):
-    global preprocessor
+def process(detected_map, input_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, detect_resolution, ddim_steps, guess_mode, strength, scale, seed, eta):
+    # global preprocessor
 
-    if det == 'Seg_OFCOCO':
-        if not isinstance(preprocessor, OneformerCOCODetector):
-            preprocessor = OneformerCOCODetector()
-    if det == 'Seg_OFADE20K':
-        if not isinstance(preprocessor, OneformerADE20kDetector):
-            preprocessor = OneformerADE20kDetector()
-    if det == 'Seg_UFADE20K':
-        if not isinstance(preprocessor, UniformerDetector):
-            preprocessor = UniformerDetector()
+    # if det == 'Seg_OFCOCO':
+    #     if not isinstance(preprocessor, OneformerCOCODetector):
+    #         preprocessor = OneformerCOCODetector()
+    # if det == 'Seg_OFADE20K':
+    #     if not isinstance(preprocessor, OneformerADE20kDetector):
+    #         preprocessor = OneformerADE20kDetector()
+    # if det == 'Seg_UFADE20K':
+    #     if not isinstance(preprocessor, UniformerDetector):
+    #         preprocessor = UniformerDetector()
 
     with torch.no_grad():
         input_image = HWC3(input_image)
 
-        if det == 'None':
-            detected_map = input_image.copy()
-        else:
-            detected_map = preprocessor(resize_image(input_image, detect_resolution))
-            detected_map = HWC3(detected_map)
+        # if det == 'None':
+        #     detected_map = input_image.copy()
+        # else:
+        #     detected_map = preprocessor(resize_image(input_image, detect_resolution))
+        #     detected_map = HWC3(detected_map)
 
         img = resize_image(input_image, image_resolution)
         H, W, C = img.shape
@@ -86,7 +86,34 @@ def process(det, input_image, prompt, a_prompt, n_prompt, num_samples, image_res
         x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
 
         results = [x_samples[i] for i in range(num_samples)]
-    return [detected_map] + results
+    return results
+
+
+def on_image_upload(det, input_image, detect_resolution):
+    global preprocessor
+
+    if det == 'Seg_OFCOCO':
+        if not isinstance(preprocessor, OneformerCOCODetector):
+            preprocessor = OneformerCOCODetector()
+    if det == 'Seg_OFADE20K':
+        if not isinstance(preprocessor, OneformerADE20kDetector):
+            preprocessor = OneformerADE20kDetector()
+    if det == 'Seg_UFADE20K':
+        if not isinstance(preprocessor, UniformerDetector):
+            preprocessor = UniformerDetector()
+            
+    # print("input", input_image.shape)
+    input_image = HWC3(input_image)
+
+    if det == 'None':
+        detected_map = input_image.copy()
+    else:
+        detected_map = preprocessor(resize_image(input_image, detect_resolution))
+        detected_map = HWC3(detected_map)
+        
+    # print("output:", detected_map.shape)
+        
+    return detected_map
 
 
 block = gr.Blocks().queue()
@@ -96,11 +123,11 @@ with block:
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(source='upload', type="numpy")
+            det = gr.Radio(choices=["Seg_OFADE20K", "Seg_OFCOCO", "Seg_UFADE20K", "None"], type="value", value="Seg_OFADE20K", label="Preprocessor")
             prompt = gr.Textbox(label="Prompt")
             run_button = gr.Button(label="Run")
             num_samples = gr.Slider(label="Images", minimum=1, maximum=12, value=1, step=1)
             seed = gr.Slider(label="Seed", minimum=-1, maximum=2147483647, step=1, value=12345)
-            det = gr.Radio(choices=["Seg_OFADE20K", "Seg_OFCOCO", "Seg_UFADE20K", "None"], type="value", value="Seg_OFADE20K", label="Preprocessor")
             with gr.Accordion("Advanced options", open=False):
                 image_resolution = gr.Slider(label="Image Resolution", minimum=256, maximum=768, value=512, step=64)
                 strength = gr.Slider(label="Control Strength", minimum=0.0, maximum=2.0, value=1.0, step=0.01)
@@ -112,8 +139,11 @@ with block:
                 a_prompt = gr.Textbox(label="Added Prompt", value='best quality')
                 n_prompt = gr.Textbox(label="Negative Prompt", value='lowres, bad anatomy, bad hands, cropped, worst quality')
         with gr.Column():
+            extracted_image = gr.Image(source="canvas", interactive=False, type="numpy")
             result_gallery = gr.Gallery(label='Output', show_label=False, elem_id="gallery").style(grid=2, height='auto')
-    ips = [det, input_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, detect_resolution, ddim_steps, guess_mode, strength, scale, seed, eta]
+    input_image.upload(on_image_upload, [det, input_image, detect_resolution], extracted_image)
+    det.change(on_image_upload, [det, input_image, detect_resolution], extracted_image)
+    ips = [extracted_image, input_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, detect_resolution, ddim_steps, guess_mode, strength, scale, seed, eta]
     run_button.click(fn=process, inputs=ips, outputs=[result_gallery])
 
 
