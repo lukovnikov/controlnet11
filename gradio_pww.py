@@ -32,6 +32,10 @@ import os
 from torch import nn, einsum
 from einops import rearrange, repeat
 from inspect import isfunction
+from pathlib import Path
+
+from annotator.util import nms
+from annotator.pidinet import PidiNetDetector
 
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
@@ -90,10 +94,8 @@ class CustomTextConditioning():
         self.strength = None
         self.threshold = None
         self.softness = 0.2
-        self._post_init()
-        
-    def _post_init(self):
-        pass
+        self.controlonly = False
+        self.controlledonly = False
         
     def cross_attention_control(self, sim):
         """ Takes the unscaled unnormalized attention scores computed by cross-attention module, returns adapted attention scores. """
@@ -103,6 +105,22 @@ class CustomTextConditioning():
     def weight_func(self, sim):
         return self._weight_func(self, sim)
     
+    def on_before_control(self):
+        if self.controlledonly:
+            # temporarily replace originally set attention control function
+            # with a function that only retains global prompt
+            self._weight_func = self._backup_weight_func
+        else:
+            self._weight_func = self._main_weight_func
+            
+    def on_before_controlled(self):
+        if self.controlonly:
+            # temporarily replace originally set attention control function
+            # with a function that only retains global prompt
+            self._weight_func = self._backup_weight_func
+        else:
+            self._weight_func = self._main_weight_func
+            
     def set_method(self, methodstr, **kw):
         if methodstr == "SepMix":
             selfcopy = copy(self)
@@ -110,28 +128,33 @@ class CustomTextConditioning():
             self._localcond = selfcopy
             self._localcond.set_method("Separate")
             self._localcond.threshold = 2
-            self._localcond.strength = 5
+            self._localcond.strength = 10
             self._globalcond = copy(selfcopy)
-            self._globalcond.set_method("PosAttn:WithBOS")
-            self._globalcond.threshold = 0.85
+            self._globalcond.set_method("PosAttn")
+            self._globalcond.threshold = 0.7
             self._globalcond.softness = 0.6
-            self._globalcond.strength = 5
+            self._globalcond.strength = 1.5
             return self
         else:
             method_functions = {
                 "Ediffi": ediffi_weight_func,
                 "Ediffi++": ediffi_pp_weight_func,
+                "Ediffi++:WithBOS": ediffi_pp_with_bos_weight_func,
                 "PosAttn": posattn_weight_func,
                 "PosAttn:WithBOS": posattn_with_bos_weight_func,
                 "PosAttn:RaiseBOS": posattn_raise_bos_weight_func,
+                "PosAttn:Both": posattn_both_weight_func,
                 "Separate": posattn_separate_weight_func,
                 "SepSwitch": posattn_sepswitch_weight_func,
-                "GlobalNeg": global_neg_weight_func,
+                "GlobalNeg": global_only_weight_func,
             }
+            # kw["register_w"] = []
+            self._backup_weight_func = partial(global_only_weight_func, **kw)    # used if controlonly or controlledonly
             if methodstr in method_functions:
                 f = method_functions[methodstr]
                 f = partial(f, **kw)
-                self._weight_func = f
+                self._main_weight_func = f
+                self._weight_func = self._main_weight_func
                 return self
             else:
                 raise Exception(f"unknown method: {methodstr}")
@@ -168,6 +191,8 @@ def ediffi_weight_func(self, sim, sigma_square=False, qk_std=False, **kw):
     max_neg_value = -torch.finfo(sim.dtype).max
     
     # use settings to compute the strength of the mask
+    if "register_w" in kw:
+        kw["register_w"].append(math.log(1 + (self.sigma_t **2 if sigma_square else self.sigma_t)))
     a = self.strength * math.log(1 + (self.sigma_t **2 if sigma_square else self.sigma_t)) * (sim.std() if qk_std else sim.max())
     
     # get the cross attention mask for the right resolution and multiply with final mask strength
@@ -181,7 +206,26 @@ def ediffi_pp_weight_func(self, sim, sigma_square=True, qk_std=True, **kw):
     return ediffi_weight_func(self, sim, sigma_square=sigma_square, qk_std=qk_std, **kw)
 
 
-def global_neg_weight_func(self, sim, **kw):
+def ediffi_pp_with_bos_weight_func(self, sim, sigma_square=True, qk_std=True, **kw):
+    # Ediffi uses the global prompt with layer annotations and adds the cross-attention mask to the attention scores
+    
+    # create negative mask that completely ignores non-global prompts
+    negmask = 1 - self.global_prompt_mask[:, None].to(sim.dtype)
+    max_neg_value = -torch.finfo(sim.dtype).max
+    
+    # use settings to compute the strength of the mask
+    a = self.strength * math.log(1 + (self.sigma_t **2 if sigma_square else self.sigma_t)) * (sim.std() if qk_std else sim.max())
+    
+    # get the cross attention mask for the right resolution and multiply with final mask strength
+    mask = self.cross_attn_masks[sim.shape[1]]
+    bosmask = self.global_bos_eos_mask[:, None].to(sim.dtype)  # (batsize, 1, seqlen)
+    mask = mask + bosmask
+    ret = mask * a
+    ret.masked_fill_(negmask > 0.5, max_neg_value)        # (batsize, 1, seqlen)
+    return ret
+
+
+def global_only_weight_func(self, sim, **kw):
     # only applies global negative mask
     # create negative mask that completely ignores non-global prompts
     negmask = 1 - self.global_prompt_mask[:, None].to(sim.dtype)
@@ -272,6 +316,26 @@ def posattn_raise_bos_weight_func(self, sim, **kw):     # sim: (batsize*numheads
     return ret
         
 
+def posattn_both_weight_func(self, sim, **kw):
+    # Positive attention with threshold that uses the local prompts and adds the cross-attention mask to the attention scores
+    
+    # create negative mask that completely ignores non-global prompts
+    # negmask = self.global_prompt_mask[:, None].to(sim.dtype)
+    # max_neg_value = -torch.finfo(sim.dtype).max
+    
+    a, b = max(0, self.threshold - self.softness / 2), min(self.threshold + self.softness / 2, 1)
+    
+    weight = 1 - _threshold_f(self.progress, a, b)
+    
+    # get the cross attention mask for the right resolution and multiply with final mask strength
+    mask = self.cross_attn_masks[sim.shape[1]]
+    bosmask = self.global_bos_eos_mask[:, None].to(sim.dtype)  # (batsize, 1, seqlen)
+    mask = mask + bosmask
+    ret = mask * weight * self.strength * sim.std()
+    # ret.masked_fill_(negmask > 0.5, max_neg_value)
+    return ret
+
+
 def posattn_separate_weight_func(self, sim, **kw):
     # Positive attention with threshold that uses the local prompts and adds the cross-attention mask to the attention scores
     
@@ -292,32 +356,40 @@ def posattn_separate_weight_func(self, sim, **kw):
 
 def posattn_sepswitch_weight_func(self, sim, **kw):
     # Positive attention with threshold that uses the local prompts 
-    # and then switches to global prompt
+    # and then switches to global prompt in posattn mode
     
     # fixed mask which keeps the relevant regions raised always
     fixedmask = self.cross_attn_masks[sim.shape[1]]     # (batsize, numpixel, seqlen)
-    bosmask = self.global_bos_eos_mask[:, None].to(sim.dtype)  # (batsize, 1, seqlen)
-    fixedmask = fixedmask + bosmask
+    # bosmask = self.global_bos_eos_mask[:, None].to(sim.dtype)  # (batsize, 1, seqlen)
+    # fixedmask = fixedmask + bosmask
     
     # get the cross attention mask for the right resolution and multiply with final mask strength
-    ret = fixedmask * self.strength * sim.std()
+    ret = fixedmask * sim.std()
     
-    a, b = max(0, self.threshold - self.softness / 2), min(self.threshold + self.softness / 2, 1)
-    weight = 1 - _threshold_f(self.progress, a, b)
+    local_strength, second_stage_strength = self.strength if isinstance(self.strength, tuple) else (self.strength, self.strength)
+    main_softness, second_stage_softness = self.softness if isinstance(self.softness, tuple) else (self.softness, 0.6)
+    main_threshold, second_stage_threshold = self.threshold if isinstance(self.threshold, tuple) else (self.threshold, self.threshold + second_stage_softness / 2)
+    
+    main_a, main_b = max(0, main_threshold - main_softness / 2), min(main_threshold + main_softness / 2, 1)
     
     # create negative mask that completely ignores non-global prompts
     globalmask = self.global_prompt_mask[:, None].to(sim.dtype)
     max_neg_value = -torch.finfo(sim.dtype).max
-    if self.progress <= a:
+    if self.progress <= main_a:
+        ret = ret * local_strength
         ret.masked_fill_(globalmask > 0.5, max_neg_value)
-    elif self.progress >= b:
+    elif self.progress >= main_b:
+        a, b = max(0, second_stage_threshold - second_stage_softness / 2), min(second_stage_threshold + second_stage_softness / 2, 1)
+        weight = 1 - _threshold_f(self.progress, a, b)
+        ret = ret * second_stage_strength * weight
         ret.masked_fill_(globalmask <= 0.5, max_neg_value)
     else:
+        main_weight = 1 - _threshold_f(self.progress, main_a, main_b)
         global_ret = ret.clone()
         global_ret.masked_fill_(globalmask <= 0.5, 0)
         local_ret = ret.clone()
         local_ret.masked_fill_(globalmask > 0.5, 0)
-        ret = local_ret * weight + (1 - weight) * global_ret
+        ret = local_ret * local_strength * main_weight + (1 - main_weight) * second_stage_strength * global_ret
     return ret
 
 
@@ -451,25 +523,30 @@ class CustomControlLDM(ControlLDM):
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond, control=None, only_mid_control=self.only_mid_control)
         else:
             if not isinstance(cond["c_crossattn"], SepMixTextConditioning):
+                cond["c_crossattn"].on_before_control()
                 control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond)
                 control = [c * scale for c, scale in zip(control, self.control_scales)]
                 if self.global_average_pooling:
                     control = [torch.mean(c, dim=(2, 3), keepdim=True) for c in control]
+                cond["c_crossattn"].on_before_controlled()
                 eps = diffusion_model(x=x_noisy, timesteps=t, context=cond, control=control, only_mid_control=self.only_mid_control)
             else:
                 cond["c_crossattn"].use_local_cond()
+                cond["c_crossattn"].on_before_control()
                 control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond)
                 control = [c * scale for c, scale in zip(control, self.control_scales)]
                 if self.global_average_pooling:
                     control = [torch.mean(c, dim=(2, 3), keepdim=True) for c in control]
+                cond["c_crossattn"].on_before_controlled()
                 local_eps = diffusion_model(x=x_noisy, timesteps=t, context=cond, control=control, only_mid_control=self.only_mid_control)
                 
                 cond["c_crossattn"].use_global_cond()
-                
+                cond["c_crossattn"].on_before_control()                
                 control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond)
                 control = [c * scale for c, scale in zip(control, self.control_scales)]
                 if self.global_average_pooling:
                     control = [torch.mean(c, dim=(2, 3), keepdim=True) for c in control]
+                cond["c_crossattn"].on_before_controlled()
                 global_eps = diffusion_model(x=x_noisy, timesteps=t, context=cond, control=control, only_mid_control=self.only_mid_control)
                 
                 eps = cond["c_crossattn"].mix_eps(local_eps, global_eps)
@@ -482,8 +559,11 @@ def default(val, d):
     return d() if isfunction(d) else d
 
 
-def create_tools():
-    model_name = 'control_v11p_sd15_seg'
+def create_tools(use_scribble_control=False):
+    if  use_scribble_control:
+        model_name = "control_v11p_sd15_scribble"
+    else:
+        model_name = 'control_v11p_sd15_seg'
     model = create_model(f'./models/{model_name}.yaml').cpu()
     model.load_state_dict(load_state_dict('./models/v1-5-pruned.ckpt', location='cuda'), strict=False)
     model.load_state_dict(load_state_dict(f'./models/{model_name}.pth', location='cuda'), strict=False)
@@ -564,7 +644,7 @@ def custom_forward(self, x, context=None, mask=None):
     return self.to_out(out)
 
         
-def get_cond(prompt, spec, num_samples, method="Ediffi", pww_strength=1.0, pww_threshold=0., pww_softness=0.2, model=None):
+def get_cond(prompt, spec, num_samples, method="Ediffi", pww_strength=1.0, pww_threshold=0., pww_softness=0.2, model=None, controlonly=False, controlledonly=False):
     xcond = model.get_learned_conditioning(prompt)
     _cross_attention_masks = compute_cross_attn_masks(spec, model.device)
     cross_attention_masks = {res: torch.index_select(_cross_attention_masks[res], 0, xcond.layer_ids[0]) for res in
@@ -577,13 +657,16 @@ def get_cond(prompt, spec, num_samples, method="Ediffi", pww_strength=1.0, pww_t
     xcond.strength = pww_strength
     xcond.threshold = pww_threshold
     xcond.softness = pww_softness
+    
+    xcond.controlonly = controlonly
+    xcond.controlledonly = controlledonly
     return xcond
     # return {"emb": text_embeddings, "masks": cross_attention_masks}
 
 
-def process(method, inpfile, segmap, prompt, num_samples, image_resolution, ddim_steps, guess_mode, strength, pww_strength, pww_threshold, pww_softness, scale, seed, eta, tools=None):
+def process(method, inpfile, segmap, prompt, num_samples, image_resolution, ddim_steps, guess_mode, strength, pww_strength, pww_threshold, pww_softness, scale, seed, eta, tools=None, controlonly=False, controlledonly=False, use_scribble_control=False):
     # print(f"Loading tools..")
-    model, sampler = create_tools() if tools is None else tools
+    model, sampler = create_tools(use_scribble_control=use_scribble_control) if tools is None else tools
     # print(f"Tools loaded.")
     print(f"PWW strength: {pww_strength}, PWW softness: {pww_softness}")
     
@@ -613,10 +696,14 @@ def process(method, inpfile, segmap, prompt, num_samples, image_resolution, ddim
         prompt, negprompt = prompt.strip(), negprompt.strip()
         
         # encode prompts
-        x_cond = get_cond(prompt, spec, num_samples, method=method, model=model, pww_strength=pww_strength, pww_threshold=pww_threshold, pww_softness=pww_softness)
+        x_cond = get_cond(prompt, spec, num_samples, method=method, model=model, 
+                          pww_strength=pww_strength, pww_threshold=pww_threshold, 
+                          pww_softness=pww_softness, controlonly=controlonly, controlledonly=controlledonly)
         cond = {"c_concat": [control], 
                 "c_crossattn": x_cond}
-        x_uncond = get_cond(negprompt, spec, num_samples, method="GlobalNeg", model=model, pww_strength=pww_strength, pww_threshold=pww_threshold, pww_softness=pww_softness)
+        x_uncond = get_cond(negprompt, spec, num_samples, method="GlobalNeg", model=model, 
+                            pww_strength=pww_strength, pww_threshold=pww_threshold, 
+                            pww_softness=pww_softness, controlonly=False, controlledonly=False)
         un_cond = {"c_concat": None if guess_mode else [control], 
                    "c_crossattn": x_uncond}
         
@@ -643,7 +730,7 @@ def process(method, inpfile, segmap, prompt, num_samples, image_resolution, ddim
     return results
 
 
-def build_segmap_from_layers(layers):
+def build_segmap_from_layers(layers, use_scribble_control=False):
     ret = None
     for layer in layers:
         randomcolor = torch.rand(3)
@@ -654,10 +741,24 @@ def build_segmap_from_layers(layers):
         ret = torch.where(mask.unsqueeze(-1) > 0.5, maskcolor, ret)
         
     ret = (ret * 255).to(torch.long).cpu().numpy()
+    
+    if use_scribble_control:
+        preprocessor = PidiNetDetector()
+        detected_map = preprocessor(resize_image(ret, 512))
+        detected_map = HWC3(detected_map)
+        img = resize_image(ret, 512)
+        H, W, C = img.shape
+
+        detected_map = cv2.resize(detected_map, (W, H), interpolation=cv2.INTER_LINEAR)
+        detected_map = nms(detected_map, 127, 3.0)
+        detected_map = cv2.GaussianBlur(detected_map, (0, 0), 3.0)
+        detected_map[detected_map > 4] = 255
+        detected_map[detected_map < 255] = 0
+        ret = detected_map
     return ret
 
 
-def upload_file(file, aprompt, nprompt):
+def upload_file(file, aprompt, nprompt, use_scribble_control=False):
     file_path = file.name
     # print("file uploaded", file_path)
     layers = psd_tools.PSDImage.open(file_path)
@@ -666,7 +767,7 @@ def upload_file(file, aprompt, nprompt):
 
     spec = unpack_layers(layers)        # TODO: add support for extra seeds and sigmas
     
-    segmap = build_segmap_from_layers(spec["layers"])
+    segmap = build_segmap_from_layers(spec["layers"], use_scribble_control=use_scribble_control)
     global_prompt = spec["global"]["pos"] + ", " + aprompt
     layerprompts = []
     for i, layer in enumerate(spec["layers"]):
@@ -736,6 +837,9 @@ def run_default(inpfile="/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd
                 scale=9.0,
                 eta=1.0,
                 tools=None,
+                controlonly=False, 
+                controlledonly=False,
+                use_scribble_control=False,
                 ):
     guess_mode = False
     a_prompt = 'best quality'
@@ -744,27 +848,38 @@ def run_default(inpfile="/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd
         def __init__(self, f):
             self.name = f
     inpfile = InpFile(inpfile)
-    image_preview, prompt = upload_file(inpfile, a_prompt, n_prompt)
+    image_preview, prompt = upload_file(inpfile, a_prompt, n_prompt, use_scribble_control=use_scribble_control)
     # print(prompt)
-    outputs = process(method, inpfile, image_preview, prompt, num_samples, image_resolution, ddim_steps, guess_mode, strength, pww_strength, pww_threshold, pww_softness, scale, seed, eta, tools=tools)
+    outputs = process(method, inpfile, image_preview, prompt, num_samples, image_resolution, ddim_steps, guess_mode, strength, pww_strength, pww_threshold, pww_softness, scale, seed, eta, tools=tools, controlonly=controlonly, controlledonly=controlledonly, use_scribble_control=use_scribble_control)
     return outputs  # (batsize, 3, H, W)
 
 
-def run_experiments_ediffi(controlonly=False, controlledonly=False):
-    model, sampler = create_tools()
+def run_experiments_ediffi(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=True):
+    print(inpfile)
+    
+    model, sampler = create_tools(use_scribble_control=use_scribble_control)
     images = []
-    savepath = os.path.join("pww_outputs", "balls_ediffi.pkl")
+
+    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd" if inpfile == "" else inpfile    
+    p = Path(filepath)
+    
+    methodname = "Ediffi"
+    extrastring = "" if not (controlonly or controlledonly) else ("_ctrl" if controlonly else "_ctrlld")
+    extrastring += ("_scribblecontrol" if use_scribble_control else "")
+    savepath = os.path.join("pww_outputs", f"{p.stem}_{methodname.lower()}{extrastring}.pkl")
+    print(f"Saving in: {savepath}")
+    
     seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
     N = 5
 
-    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd"
-    pww_strengths = [0.0, 0.1, 0.2, 0.25, 0.3, 0.35, 0.4, 0.6]
+    # pww_strengths = [0.0, 0.1, 0.2, 0.25, 0.3, 0.35, 0.4, 0.6]
+    pww_strengths = [0.0, 0.05, 0.075, 0.1, 0.15, 0.2, 0.5]
     for c in pww_strengths:
         print(f"pww strength={c}")
         outputs = []
         for seed in seeds[:N]:
-            image = run_default(filepath, pww_strength=c, seed=seed, method="Ediffi", 
-                                tools=(model, sampler))[0]
+            image = run_default(filepath, pww_strength=c, seed=seed, method=methodname, 
+                                tools=(model, sampler), controlonly=controlonly, controlledonly=controlledonly, use_scribble_control=use_scribble_control)[0]
             image = Image.fromarray(image)
             outputs.append({"image": image, "seed": seed})
         
@@ -779,21 +894,29 @@ def run_experiments_ediffi(controlonly=False, controlledonly=False):
             pickle.dump(images, f)
             
             
-def run_experiments_ediffi_pp(controlonly=False, controlledonly=False):
-    model, sampler = create_tools()
+def run_experiments_ediffi_pp(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=True):
+    model, sampler = create_tools(use_scribble_control=use_scribble_control)
     images = []
-    savepath = os.path.join("pww_outputs", "balls_ediffi_pp.pkl")
+    
+    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd" if inpfile == "" else inpfile    
+    p = Path(filepath)
+    
+    methodname = "Ediffi++"
+    extrastring = "" if not (controlonly or controlledonly) else ("_ctrl" if controlonly else "_ctrlld")
+    extrastring += ("_scribblecontrol" if use_scribble_control else "")
+    savepath = os.path.join("pww_outputs", f"{p.stem}_{methodname.lower()}{extrastring}.pkl")
+    print(f"Saving in: {savepath}")
+    
     seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
     N = 5
 
-    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd"
-    pww_strengths = [0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.2, 2]
+    pww_strengths = [0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.2, 1.5, 2]
     for c in pww_strengths:
         print(f"pww strength={c}")
         outputs = []
         for seed in seeds[:N]:
-            image = run_default(filepath, pww_strength=c, seed=seed, method="Ediffi++",
-                                tools=(model, sampler))[0]
+            image = run_default(filepath, pww_strength=c, seed=seed, method=methodname,
+                                tools=(model, sampler), controlonly=controlonly, controlledonly=controlledonly, use_scribble_control=use_scribble_control)[0]
             image = Image.fromarray(image)
             outputs.append({"image": image, "seed": seed})
         
@@ -808,55 +931,161 @@ def run_experiments_ediffi_pp(controlonly=False, controlledonly=False):
             pickle.dump(images, f)
             
             
-def run_experiments_posattn(controlonly=False, controlledonly=False):
-    model, sampler = create_tools()
+def run_experiments_ediffi_pp_with_bos(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=True):
+    model, sampler = create_tools(use_scribble_control=use_scribble_control)
     images = []
-    savepath = os.path.join("pww_outputs", "balls_posattn.pkl")
+    
+    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls2.psd" if inpfile == "" else inpfile    
+    p = Path(filepath)
+    
+    methodname = "Ediffi++:WithBOS"
+    extrastring = "" if not (controlonly or controlledonly) else ("_ctrl" if controlonly else "_ctrlld")
+    extrastring += ("_scribblecontrol" if use_scribble_control else "")
+    savepath = os.path.join("pww_outputs", f"{p.stem}_{methodname.lower()}{extrastring}.pkl")
+    print(f"Saving in: {savepath}")
+    
     seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
     N = 5
-    s = 0.2
 
-    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd"
-    pww_thresholds = [0.3, 0.5, 0.7, 0.2, 0.1, 0.]
-    for t in pww_thresholds:
-        pww_strengths = [1., 2., 3., 4.]
-        if t <= 0.5:
-            pww_strengths.append(5.)
-        if t <= 0.3:
-            pww_strengths.append(10.)
-        if t == 0.:
-            pww_strengths = [0.]
-        for c in pww_strengths:
-            print(f"pww threshold={t}, strength={c}, softness={s}")
-            outputs = []
-            for seed in seeds[:N]:
-                image = run_default(filepath, pww_strength=c, pww_threshold=t, pww_softness=s, seed=seed, method="PosAttn",
-                                    tools=(model, sampler))[0]
-                image = Image.fromarray(image)
-                outputs.append({"image": image, "seed": seed})
+    pww_strengths = [0.0, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.2, 2, 4, 8]
+    for c in pww_strengths:
+        print(f"pww strength={c}")
+        outputs = []
+        for seed in seeds[:N]:
+            image = run_default(filepath, pww_strength=c, seed=seed, method=methodname,
+                                tools=(model, sampler), controlonly=controlonly, controlledonly=controlledonly, use_scribble_control=use_scribble_control)[0]
+            image = Image.fromarray(image)
+            outputs.append({"image": image, "seed": seed})
+        
+        for o in outputs:
+            o.update({"inputfile": filepath,
+                    "strength": c,
+                    "method": "ediffi_pp_wbos",})
+            images.append(o)
+
+        print("saving to pickle")
+        with open(savepath, "wb") as f:
+            pickle.dump(images, f)
             
-            for o in outputs:
-                o.update({"inputfile": filepath,
-                        "strength": c,
-                        "threshold": t,
-                        "softness": s,
-                        "method": "posattn",})
-                images.append(o)
+            
+def run_experiments_posattn(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=True):
+    model, sampler = create_tools(use_scribble_control=use_scribble_control)
+    images = []
 
-            print("saving to pickle")
-            with open(savepath, "wb") as f:
-                pickle.dump(images, f)
+    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd" if inpfile == "" else inpfile    
+    p = Path(filepath)
+    
+    methodname = "PosAttn"
+    extrastring = "" if not (controlonly or controlledonly) else ("_ctrl" if controlonly else "_ctrlld")
+    extrastring += ("_scribblecontrol" if use_scribble_control else "")
+    savepath = os.path.join("pww_outputs", f"{p.stem}_{methodname.lower()}{extrastring}.pkl")
+    print(f"Saving in: {savepath}")
+    
+    seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
+    N = 5
+
+    for s in [0.2, 0.6]:
+        if s == 0.2:
+            pww_thresholds = [0.25, 0.5, 0.75, 0.1, 0.]
+        elif s == 0.6:
+            pww_thresholds = [0.25, 0.5, 0.75]
+            
+        for t in pww_thresholds:
+            pww_strengths = [1., 2., 3.5,  5.]
+            if t <= 0.3:
+                pww_strengths.append(10.)
+            if t == 0.:
+                pww_strengths = [0.]
+            for c in pww_strengths:
+                print(f"pww threshold={t}, strength={c}, softness={s}")
+                outputs = []
+                for seed in seeds[:N]:
+                    image = run_default(filepath, pww_strength=c, pww_threshold=t, pww_softness=s, seed=seed, method=methodname,
+                                        tools=(model, sampler), controlonly=controlonly, controlledonly=controlledonly, use_scribble_control=use_scribble_control)[0]
+                    image = Image.fromarray(image)
+                    outputs.append({"image": image, "seed": seed})
+                
+                for o in outputs:
+                    o.update({"inputfile": filepath,
+                            "strength": c,
+                            "threshold": t,
+                            "softness": s,
+                            "method": "posattn",})
+                    images.append(o)
+
+                print("saving to pickle")
+                with open(savepath, "wb") as f:
+                    pickle.dump(images, f)
+                    
+            
+def run_experiments_posattn_both(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=True):
+    model, sampler = create_tools(use_scribble_control=use_scribble_control)
+    images = []
+
+    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd" if inpfile == "" else inpfile    
+    p = Path(filepath)
+    
+    methodname = "PosAttn:Both"
+    lowermethodname = methodname.lower().replace(":", "_")
+    extrastring = "" if not (controlonly or controlledonly) else ("_ctrl" if controlonly else "_ctrlld")
+    extrastring += ("_scribblecontrol" if use_scribble_control else "")
+    savepath = os.path.join("pww_outputs", f"{p.stem}_{lowermethodname}{extrastring}.pkl")
+    print(f"Saving in: {savepath}")
+    
+    seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
+    N = 5
+
+    for s in [0.2, 0.6]:
+        if s == 0.2:
+            pww_thresholds = [0.25, 0.5, 0.75, 0.1, 0., 2]
+        elif s == 0.6:
+            pww_thresholds = [0.25, 0.5, 0.75]
+            
+        for t in pww_thresholds:
+            pww_strengths = [1., 2., 3.5,  5.]
+            if t <= 0.3:
+                pww_strengths.append(10.)
+            if t == 0.:
+                pww_strengths = [0.]
+            for c in pww_strengths:
+                print(f"pww threshold={t}, strength={c}, softness={s}")
+                outputs = []
+                for seed in seeds[:N]:
+                    image = run_default(filepath, pww_strength=c, pww_threshold=t, pww_softness=s, seed=seed, method=methodname,
+                                        tools=(model, sampler), controlonly=controlonly, controlledonly=controlledonly, use_scribble_control=use_scribble_control)[0]
+                    image = Image.fromarray(image)
+                    outputs.append({"image": image, "seed": seed})
+                
+                for o in outputs:
+                    o.update({"inputfile": filepath,
+                            "strength": c,
+                            "threshold": t,
+                            "softness": s,
+                            "method": lowermethodname})
+                    images.append(o)
+
+                print("saving to pickle")
+                with open(savepath, "wb") as f:
+                    pickle.dump(images, f)
                 
 
-def run_experiments_posattn_with_bos(controlonly=False, controlledonly=False):
-    model, sampler = create_tools()
+def run_experiments_posattn_with_bos(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=True):
+    model, sampler = create_tools(use_scribble_control=use_scribble_control)
     images = []
-    savepath = os.path.join("pww_outputs", "balls_posattn_with_bos.pkl")
+
+    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd" if inpfile == "" else inpfile    
+    p = Path(filepath)
+    
+    methodname = "PosAttn:WithBOS"
+    extrastring = "" if not (controlonly or controlledonly) else ("_ctrl" if controlonly else "_ctrlld")
+    extrastring += ("_scribblecontrol" if use_scribble_control else "")
+    savepath = os.path.join("pww_outputs", f"{p.stem}_{methodname.lower()}{extrastring}.pkl")
+    print(f"Saving in: {savepath}")
+    
     seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
     N = 5
     s = 0.2
 
-    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd"
     pww_thresholds = [-1., 0.25, 0.5, 0.75, 1.5]
     for t in pww_thresholds:
         pww_strengths = [1., 2., 5., 10]
@@ -866,8 +1095,8 @@ def run_experiments_posattn_with_bos(controlonly=False, controlledonly=False):
             print(f"pww threshold={t}, strength={c}, softness={s}")
             outputs = []
             for seed in seeds[:N]:
-                image = run_default(filepath, pww_strength=c, pww_threshold=t, pww_softness=s, seed=seed, method="PosAttn:WithBOS",
-                                    tools=(model, sampler))[0]
+                image = run_default(filepath, pww_strength=c, pww_threshold=t, pww_softness=s, seed=seed, method=methodname,
+                                    tools=(model, sampler), controlonly=controlonly, controlledonly=controlledonly, use_scribble_control=use_scribble_control)[0]
                 image = Image.fromarray(image)
                 outputs.append({"image": image, "seed": seed})
             
@@ -884,15 +1113,23 @@ def run_experiments_posattn_with_bos(controlonly=False, controlledonly=False):
                 pickle.dump(images, f)
                 
 
-def run_experiments_posattn_raise_bos(controlonly=False, controlledonly=False):
-    model, sampler = create_tools()
+def run_experiments_posattn_raise_bos(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=True):
+    model, sampler = create_tools(use_scribble_control=use_scribble_control)
     images = []
-    savepath = os.path.join("pww_outputs", "balls_posattn_raise_bos.pkl")
+    
+    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd" if inpfile == "" else inpfile    
+    p = Path(filepath)
+    
+    methodname = "PosAttn:RaiseBOS"
+    extrastring = "" if not (controlonly or controlledonly) else ("_ctrl" if controlonly else "_ctrlld")
+    extrastring += ("_scribblecontrol" if use_scribble_control else "")
+    savepath = os.path.join("pww_outputs", f"{p.stem}_{methodname.lower()}{extrastring}.pkl")
+    print(f"Saving in: {savepath}")
+    
     seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
     N = 5
     s = 0.2
 
-    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd"
     pww_thresholds = [0.3, 0.5, 0.7, 0.2, 0.1, 0.]
     for t in pww_thresholds:
         pww_strengths = [1., 2., 3., 4.]
@@ -907,7 +1144,7 @@ def run_experiments_posattn_raise_bos(controlonly=False, controlledonly=False):
             outputs = []
             for seed in seeds[:N]:
                 image = run_default(filepath, pww_strength=c, pww_threshold=t, pww_softness=s, seed=seed, 
-                                    method="PosAttn:RaiseBOS", tools=(model, sampler))[0]
+                                    method=methodname, tools=(model, sampler), controlonly=controlonly, controlledonly=controlledonly, use_scribble_control=use_scribble_control)[0]
                 image = Image.fromarray(image)
                 outputs.append({"image": image, "seed": seed})
             
@@ -924,24 +1161,32 @@ def run_experiments_posattn_raise_bos(controlonly=False, controlledonly=False):
                 pickle.dump(images, f)
                 
 
-def run_experiments_separate(controlonly=False, controlledonly=False):
-    model, sampler = create_tools()
+def run_experiments_separate(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=True):
+    model, sampler = create_tools(use_scribble_control=use_scribble_control)
     images = []
-    savepath = os.path.join("pww_outputs", "balls_separate.pkl")
+    
+    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd" if inpfile == "" else inpfile    
+    p = Path(filepath)
+    
+    methodname = "Separate"
+    extrastring = "" if not (controlonly or controlledonly) else ("_ctrl" if controlonly else "_ctrlld")
+    extrastring += ("_scribblecontrol" if use_scribble_control else "")
+    savepath = os.path.join("pww_outputs", f"{p.stem}_{methodname.lower()}{extrastring}.pkl")
+    print(f"Saving in: {savepath}")
+    
     seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
     N = 5
     s = 0.2
 
-    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd"
-    pww_thresholds = [0.1, 0.25, 2., 0.5, 0.75]  #[0.3, 0.5, 0.7, 0.2, 0.1, 0.]
+    pww_thresholds = [2., 0.1, 0.25, 0.5, 0.75]  #[0.3, 0.5, 0.7, 0.2, 0.1, 0.]
     for t in pww_thresholds:
-        pww_strengths = [10., 1., 4.]
+        pww_strengths = [10., 1., 4., 0.2]
         for c in pww_strengths:
             print(f"pww threshold={t}, strength={c}, softness={s}")
             outputs = []
             for seed in seeds[:N]:
                 image = run_default(filepath, pww_strength=c, pww_threshold=t, pww_softness=s, seed=seed, 
-                                    method="Separate", tools=(model, sampler))[0]
+                                    method=methodname, tools=(model, sampler), controlonly=controlonly, controlledonly=controlledonly, use_scribble_control=use_scribble_control)[0]
                 image = Image.fromarray(image)
                 outputs.append({"image": image, "seed": seed})
             
@@ -958,25 +1203,35 @@ def run_experiments_separate(controlonly=False, controlledonly=False):
                 pickle.dump(images, f)
                 
                 
-def run_experiments_sepswitch(controlonly=False, controlledonly=False):
-    model, sampler = create_tools()
+def run_experiments_sepswitch(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=True):
+    model, sampler = create_tools(use_scribble_control=use_scribble_control)
     images = []
-    savepath = os.path.join("pww_outputs", "balls_sepswitch_vsoft.pkl")
+    
+    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd" if inpfile == "" else inpfile    
+    p = Path(filepath)
+    
+    methodname = "SepSwitch"
+    extrastring = "" if not (controlonly or controlledonly) else ("_ctrl" if controlonly else "_ctrlld")
+    extrastring += ("_scribblecontrol" if use_scribble_control else "")
+    savepath = os.path.join("pww_outputs", f"{p.stem}_{methodname.lower()}{extrastring}.pkl")
+    print(f"Saving in: {savepath}")
+    
     seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
     N = 5
-    s = 0.5
 
-    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd"
-    pww_thresholds = [0., 00.05, 0.075, 0.1, 0.25]  #[0.3, 0.5, 0.7, 0.2, 0.1, 0.]
-    for s in [0.1, 0.]:
+    pww_thresholds = [-1., 0.05, 0.075, 0.1, 0.125, 0.15, 0.25, 0.5]  #[0.3, 0.5, 0.7, 0.2, 0.1, 0.]
+    for s in [0]: # , 0.1]:
         for t in pww_thresholds:
-            pww_strengths = [1., 1.5, 2., 4., 10]
+            if t < 0:
+                pww_strengths = [(0, 0)]
+            else:
+                pww_strengths = [(10, 0), (10, 1.), (10, 1.5), (10, 2), (10, 3), (10, 4)] #[1., 1.5, 2., 4., 10]
             for c in pww_strengths:
                 print(f"pww threshold={t}, strength={c}, softness={s}")
                 outputs = []
                 for seed in seeds[:N]:
                     image = run_default(filepath, pww_strength=c, pww_threshold=t, pww_softness=s, seed=seed, 
-                                        method="SepSwitch", tools=(model, sampler))[0]
+                                        method=methodname, tools=(model, sampler), controlonly=controlonly, controlledonly=controlledonly, use_scribble_control=use_scribble_control)[0]
                     image = Image.fromarray(image)
                     outputs.append({"image": image, "seed": seed})
                 
@@ -993,15 +1248,21 @@ def run_experiments_sepswitch(controlonly=False, controlledonly=False):
                     pickle.dump(images, f)
                 
                 
-def run_experiments_sepmix(controlonly=False, controlledonly=False):
-    model, sampler = create_tools()
+def run_experiments_sepmix(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=True):
+    model, sampler = create_tools(use_scribble_control=use_scribble_control)
     images = []
-    savepath = os.path.join("pww_outputs", "balls_sepmix.pkl")
+    
+    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd" if inpfile == "" else inpfile    
+    p = Path(filepath)
+    
+    extrastring = "_scribblecontrol" if use_scribble_control else ""
+    
+    savepath = os.path.join("pww_outputs", f"{p.stem}_sepmix{extrastring}.pkl")
+    print(f"Saving in: {savepath}")
     seeds = [42, 420, 426, 123, 68, 79, 1337, 234, 1234, 876]
     N = 5
     s = 0.2
 
-    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd"
     pww_thresholds = [0.05, 0.1, 0.25, 0.5]  #[0.3, 0.5, 0.7, 0.2, 0.1, 0.]
     for t in pww_thresholds:
         pww_strengths = [1., 0.25, 0.5, 0.75]
@@ -1010,7 +1271,7 @@ def run_experiments_sepmix(controlonly=False, controlledonly=False):
             outputs = []
             for seed in seeds[:N]:
                 image = run_default(filepath, pww_strength=c, pww_threshold=t, pww_softness=s, seed=seed, 
-                                    method="SepMix", tools=(model, sampler))[0]
+                                    method="SepMix", tools=(model, sampler), controlonly=controlonly, controlledonly=controlledonly, use_scribble_control=use_scribble_control)[0]
                 image = Image.fromarray(image)
                 outputs.append({"image": image, "seed": seed})
             
@@ -1030,34 +1291,79 @@ def run_experiments_sepmix(controlonly=False, controlledonly=False):
 def main(server=False,
          ediffi=False,
          ediffipp=False,
+         ediffippwbos=False,
          posattn=False,
          posattnwbos=False,
          posattnbos=False,
+         posattnboth=False,
          separate=False,
          sepswitch=False,
          sepmix=False,
          controlonly=False,
          controlledonly=False,
+         inpfile="",
+         strength=-1,
          ):
     assert sum([server, ediffi, ediffipp, posattn, posattnbos, separate]) <= 1
     if server: start_server()
-    elif ediffi: print("Running ediffi experiments") ; run_experiments_ediffi(controlonly=controlonly, controlledonly=controlledonly)
-    elif ediffipp: print("Running ediffi experiments") ; run_experiments_ediffi_pp(controlonly=controlonly, controlledonly=controlledonly)
-    elif posattn: run_experiments_posattn(controlonly=controlonly, controlledonly=controlledonly)
-    elif posattnwbos: run_experiments_posattn_with_bos(controlonly=controlonly, controlledonly=controlledonly)
-    elif posattnbos: run_experiments_posattn_raise_bos(controlonly=controlonly, controlledonly=controlledonly)
-    elif separate: run_experiments_separate(controlonly=controlonly, controlledonly=controlledonly)
-    elif sepswitch: run_experiments_sepswitch(controlonly=controlonly, controlledonly=controlledonly)
-    elif sepmix: run_experiments_sepmix(controlonly=controlonly, controlledonly=controlledonly)
-    #else: print("Choose what to run") ; run_experiments_sepmix(controlonly=controlonly, controlledonly=controlledonly)
-    else: print("Choose what to run") ; run_experiments_sepswitch(controlonly=controlonly, controlledonly=controlledonly)
-    #else: print("Choose what to run") ; run_experiments_posattn_with_bos(controlonly=controlonly, controlledonly=controlledonly)
+    elif ediffi: print("Running ediffi experiments") ; run_experiments_ediffi(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    elif ediffipp: print("Running ediffi-pp experiments") ; run_experiments_ediffi_pp(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    elif ediffippwbos: print("Running ediffi-pp-with-bos experiments") ; run_experiments_ediffi_pp_with_bos(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    elif posattn: run_experiments_posattn(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    elif posattnwbos: run_experiments_posattn_with_bos(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    elif posattnbos: run_experiments_posattn_raise_bos(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    elif posattnboth: run_experiments_posattn_both(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    elif separate: run_experiments_separate(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    elif sepswitch: run_experiments_sepswitch(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    elif sepmix: run_experiments_sepmix(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    #else: print("Choose what to run") ; run_experiments_sepmix(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    # else: print("Choose what to run") ; run_experiments_sepswitch(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    # else: print("Choose what to run") ; run_experiments_ediffi(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    # else: print("Choose what to run") ; run_experiments_ediffi_pp_with_bos(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    else: print("Choose what to run") ; run_experiments_posattn_both(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    #else: print("Choose what to run") ; run_experiments_posattn_with_bos(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
                             
 
 if __name__ == "__main__":
     fire.Fire(main)
     
-    # TODO: implement SepMix with decaying Posattn and decaying BOS
-    # TODO: what happens if we disable cross attention control on controlling model or on controlled model?
+    # DONE: what happens if we disable cross attention control on controlling model or on controlled model?
+    # DONE: try hard switch from separate to posattn with strength 0 (so no attention control)
+    
+    # OBS: doing sepswitch with attention control only in controlnet results doesn't really control the outputs,
+    #      even when running with separate model over entire denoising process
+    #      Most (99%) of the effect of the cross-attention control is from the controlled network.
+    
+    # DONE: Implement SepSwitch with decaying posattn
+    
+    # OBS: Separate mode alone introduces flatness to the image of balls.
+    # OBS: Posattn alone with a low weight has better image quality with fewer artifacts but
+    # 
+    
+    # TODO: check whether attention control on the up-sampling part of Unet is enough
+    
+    # DONE: check again posattn-withbos
+    # DONE: try ediffi++withbos: 
+    #      - OBS: ignores clouds at the bottom
+    # DONE: try global+local posattn <-- fairer competitor to sepswitch
+    #      - OBS: basically the same as separate
+    # TODO: sepswitch but with ediffi schedule for second stage
+    
+    # TODO: segmap color scheme ? <- maybe this causes some problems too
+    
+    # TODO: compare posattn to posattn controlled-only
+    # TODO: try controlled-only posattn in sepswitch
+    
+    # MAYBE:
     # TODO: verify ediffi does not include BOS token
+    
+    
+    # IDEA: fine-tune cross-attention of main stable diffusion:
+    #       - use the "both" setting and add extra embeddings that indicate whether token is from local prompt or global prompt, and maybe also whether it is relevant to the region or not (if we do the both variant that exposes the entire global prompt)
+    #           - start with "both" setting where we expose global BOS, relevant global tokens and all local tokens and use only global/local extra embeddings
+    #       - losses: (1) predict image under given attention mask and additional embeddings
+    #                 (2) cross-attention preservation: make sure it works as before in normal setting
+    #       - data: COCO: problem!: COCO does not tell which parts of global prompt are where so we just train with full original prompt
+    #                        idea to solve problem: automatically generate prompt that mentions all the parts and train with this one with 50% probability
+    
     
