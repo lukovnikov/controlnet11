@@ -39,6 +39,7 @@ from annotator.pidinet import PidiNetDetector
 
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
+
 def _tokenize_annotated_prompt(prompt, tokenizer):
     prompt = re.split(r"(\{[^\}]+\})", prompt)
     _prompt = []

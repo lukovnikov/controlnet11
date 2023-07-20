@@ -779,7 +779,7 @@ class LatentDiffusion(DDPM):
             if cond_key != self.first_stage_key:
                 if cond_key in ['caption', 'coordinates_bbox', "txt"]:
                     xc = batch[cond_key]
-                elif cond_key in ['class_label', 'cls']:
+                elif cond_key in ['class_label', 'cls', 'all']:
                     xc = batch
                 else:
                     xc = super().get_input(batch, cond_key).to(self.device)

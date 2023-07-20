@@ -8,6 +8,7 @@
 # thanks!
 
 
+from functools import partial
 import os
 import math
 import torch
@@ -99,6 +100,77 @@ def extract_into_tensor(a, t, x_shape):
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
+def torch_cat_nested(a, b):     # merges nested mirrored datastructures a and b using f on their leaf elements
+    if isinstance(a, dict):
+        assert isinstance(b, type(a))
+        ret = dict()        # TODO support for different subtypes of dict (OrderedDict)?
+        for k in a:
+            ret[k] = torch_cat_nested(a[k], b[k])
+    elif isinstance(a, (list, tuple)):
+        assert isinstance(b, type(a))
+        ret = []
+        for a_elem, b_elem in zip(a, b):
+            ret.append(torch_cat_nested(a_elem, b_elem))
+        if isinstance(a, tuple):
+            ret = tuple(ret)
+    elif isinstance(a, torch.Tensor):
+        ret = torch.cat([a, b], 0)
+    elif hasattr(a, "torch_cat_nested"):
+        assert isinstance(b, type(a))
+        ret = a.torch_cat_nested(b)
+    else:
+        raise NotImplemented(f"Type {type(a)} not supported in torch_cat_nested")
+    return ret
+        
+
+def unflatten_elem_subf(x, f=None, numargs=1):
+    args, rest = x[:numargs], x[numargs:]
+    ret = f(args)
+    return ret, rest
+    
+    
+def flatten_inputs(inputs):
+    if isinstance(inputs, torch.Tensor):
+        return [inputs], lambda x: x[0]
+    elif isinstance(inputs, (list, tuple)):
+        istuple = isinstance(inputs, tuple)
+        flat_out = []
+        unflatten_elem_fs = []
+        for elem in inputs:
+            flat_elem, unflatten_elem = flatten_inputs(elem)
+            unflatten_elem_f = partial(unflatten_elem_subf, f=unflatten_elem, numargs=len(flat_elem))
+            unflatten_elem_fs.append(unflatten_elem_f)
+            flat_out += flat_elem
+        def unflatten_list(x):
+            ret = []
+            for unflatten_elem_f in unflatten_elem_fs:
+                retelem, x = unflatten_elem_f(x)
+                ret.append(retelem)
+            if istuple:
+                ret = tuple(ret)
+            return ret
+        return flat_out, unflatten_list
+    elif isinstance(inputs, dict):
+        flat_out = []
+        unflatten_elem_fs = {}
+        for k, v in inputs.items():
+            flat_elem, unflatten_elem = flatten_inputs(v)
+            unflatten_elem_f = partial(unflatten_elem_subf, f=unflatten_elem, numargs=len(flat_elem))
+            unflatten_elem_fs[k] = unflatten_elem_f
+            flat_out += flat_elem
+        def unflatten_dict(x):
+            ret = {}
+            for k, unflatten_elem_f in unflatten_elem_fs.items():
+                retelem, x = unflatten_elem_f(x)
+                ret[k] = retelem
+            return ret
+        return flat_out, unflatten_dict
+    elif hasattr(inputs, "flatten_inputs_for_gradient_checkpoint"):
+        return inputs.flatten_inputs_for_gradient_checkpoint()
+    else:
+        raise Exception()
+
+
 def checkpoint(func, inputs, params, flag):
     """
     Evaluate a function without caching intermediate activations, allowing for
@@ -110,8 +182,9 @@ def checkpoint(func, inputs, params, flag):
     :param flag: if False, disable gradient checkpointing.
     """
     if flag:
-        args = tuple(inputs) + tuple(params)
-        return CheckpointFunction.apply(func, len(inputs), *args)
+        flatinputs, unflattener = flatten_inputs(inputs)
+        args = tuple(flatinputs) + tuple(params)
+        return CheckpointFunction.apply(lambda *x: func(*unflattener(x)), len(flatinputs), *args)
     else:
         return func(*inputs)
 
@@ -131,7 +204,9 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *output_grads):
+        # breakpoint()
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
+        ctx.input_params = [x.requires_grad_(True) for x in ctx.input_params]
         with torch.enable_grad(), \
                 torch.cuda.amp.autocast(**ctx.gpu_autocast_kwargs):
             # Fixes a bug where the first op in run_function modifies the
@@ -268,3 +343,7 @@ def noise_like(shape, device, repeat=False):
     repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device).repeat(shape[0], *((1,) * (len(shape) - 1)))
     noise = lambda: torch.randn(shape, device=device)
     return repeat_noise() if repeat else noise()
+
+
+if __name__ == "__main__":
+    tst_flattener()

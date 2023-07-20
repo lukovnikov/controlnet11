@@ -43,7 +43,7 @@ def process(det, input_image, prompt, a_prompt, n_prompt, num_samples, image_res
 
         if det == 'None':
             detected_map = input_image.copy()
-        else:
+        else:       # preprocessor takes a numpy image (H, W, C) with 0..256 values
             detected_map = preprocessor(resize_image(input_image, detect_resolution))
             detected_map = HWC3(detected_map)
 

@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 
-from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like, extract_into_tensor
+from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like, extract_into_tensor, torch_cat_nested
 
 
 class DDIMSampler(object):
@@ -189,25 +189,26 @@ class DDIMSampler(object):
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
-            if isinstance(c, dict):
-                assert isinstance(unconditional_conditioning, dict)
-                c_in = dict()
-                for k in c:
-                    if isinstance(c[k], list):
-                        c_in[k] = [torch.cat([
-                            unconditional_conditioning[k][i],
-                            c[k][i]]) for i in range(len(c[k]))]
-                    else:
-                        c_in[k] = torch.cat([
-                                unconditional_conditioning[k],
-                                c[k]])
-            elif isinstance(c, list):
-                c_in = list()
-                assert isinstance(unconditional_conditioning, list)
-                for i in range(len(c)):
-                    c_in.append(torch.cat([unconditional_conditioning[i], c[i]]))
-            else:
-                c_in = torch.cat([unconditional_conditioning, c])
+            c_in = torch_cat_nested(unconditional_conditioning, c)  # concatenate conditional and unconditional prompt into one batch
+            # if isinstance(c, dict):
+            #     assert isinstance(unconditional_conditioning, dict)
+            #     c_in = dict()
+            #     for k in c:      
+            #         if isinstance(c[k], list):
+            #             c_in[k] = [torch.cat([
+            #                 unconditional_conditioning[k][i],
+            #                 c[k][i]]) for i in range(len(c[k]))]
+            #         else:
+            #             c_in[k] = torch.cat([
+            #                     unconditional_conditioning[k],
+            #                     c[k]])
+            # elif isinstance(c, list):
+            #     c_in = list()
+            #     assert isinstance(unconditional_conditioning, list)
+            #     for i in range(len(c)):
+            #         c_in.append(torch.cat([unconditional_conditioning[i], c[i]]))
+            # else:
+            #     c_in = torch.cat([unconditional_conditioning, c])
             model_uncond, model_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
             model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
 

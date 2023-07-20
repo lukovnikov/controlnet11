@@ -11,6 +11,8 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 import itertools
 import numpy as np
+import colorsys
+from einops import rearrange, repeat
 
 
 class ProcessedCOCOExample(object):
@@ -32,11 +34,48 @@ def _img_importance_flatten(img: torch.tensor, w: int, h: int) -> torch.tensor:
     ).squeeze()
     
     
+def colorgen(num_colors=100):
+    for i in range(1, num_colors):
+        r = (i * 53) % 256  # Adjust the prime number for different color patterns
+        g = (i * 97) % 256
+        b = (i * 163) % 256
+        yield [r/256, g/256, b/256]
+        
+
+def colorgen_hsv(numhues=36):
+    hue = random.randint(0, 360)
+    usehues = set()
+    huestep = round(360/numhues)
+    retries = 0
+    while True:
+        sat = random.uniform(0.5, 0.9)
+        val = random.uniform(0.3, 0.7)
+        yield colorsys.hsv_to_rgb(hue/360, sat, val)
+        usehues.add(hue)
+        # change hue 
+        while hue in usehues:
+            hue = (hue + huestep * random.randint(0, int(360/huestep))) % 360
+            retries += 1
+            if retries > numhues:
+                usehues = set()
+                retries = 0
+                continue
+            
+            
+def randomcolor_hsv():
+    hue = random.uniform(0, 360)
+    sat = random.uniform(0.5, 0.9)
+    val = random.uniform(0.3, 0.7)
+    return colorsys.hsv_to_rgb(hue/360, sat, val)
+    
+    
 def materialize_example(example):
     # materialize one example
     # 3. load image
     img = Image.open(example.image_path).convert("RGB")
     imgtensor = to_tensor(img)
+    cond_imgtensor = torch.ones_like(imgtensor) * torch.tensor(randomcolor_hsv())[:, None, None]
+    
     # 1. pick one caption at random (TODO: or generate one from regions)
     captions = [random.choice(example.captions)[0]]
     # initialize layer ids
@@ -44,10 +83,17 @@ def materialize_example(example):
     # 4. load masks
     masks = [torch.ones_like(imgtensor[0], dtype=torch.bool)]
     # 2. get the captions of the regions and build layer ids
+    # coloriter = colorgen_hsv()
     for i, region in enumerate(example.regions):
         captions.append(region[1][0])
         layerids.append(torch.ones_like(region[1][0]) * (i + 1))
         masks.append(torch.tensor(region[0]))
+        
+        randomcolor = torch.tensor(randomcolor_hsv())
+        mask = torch.tensor(region[0])
+        maskcolor = mask.unsqueeze(0).repeat(3, 1, 1) * randomcolor[:, None, None]
+    
+        cond_imgtensor = torch.where(mask.unsqueeze(0) > 0.5, maskcolor, cond_imgtensor)
     # finalize captions and layer ids
 #         caption, layerids = torch.cat(captions, 0), torch.cat(layerids, 0)
 
@@ -58,6 +104,7 @@ def materialize_example(example):
     # print(cropsize)
     
     imgtensor = imgtensor[:, crop[0]:crop[0]+cropsize, crop[1]:crop[1]+cropsize]
+    cond_imgtensor = cond_imgtensor[:, crop[0]:crop[0]+cropsize, crop[1]:crop[1]+cropsize]
     masks = [maske[crop[0]:crop[0]+cropsize, crop[1]:crop[1]+cropsize] for maske in masks]
     
     # compute downsampled versions of the layer masks
@@ -79,7 +126,10 @@ def materialize_example(example):
             downmasktensors[res].append(downmask)
     downmasktensors = {k: torch.stack(v, 0) for k, v in downmasktensors.items()}
     
+    # TODO: provide conditioning image based on layers
+    
     return {"image": imgtensor, 
+            "cond_image": cond_imgtensor,
             "captions": captions,
             "layerids": layerids,
             "regionmasks": downmasktensors
@@ -258,8 +308,9 @@ class COCODataset(IterableDataset):
             examples = [example for example in examples if example["image"].shape[1] == majoritysize]
         
         # every example is dictionary like specified above
-        # TODO
+        
         images = []
+        cond_images = []
         captions = []
         regionmasks = []
         layerids = []
@@ -267,6 +318,7 @@ class COCODataset(IterableDataset):
         
         for example in examples:
             images.append(example["image"])   # concat images
+            cond_images.append(example["cond_image"])
             captions.append(torch.cat(example["captions"], 0))   # batchify captions
             regioncounts.append(len(example["captions"]))  # keep track of the number of regions per example
             layerids.append(torch.cat(example["layerids"], 0))   # layer ids
@@ -275,6 +327,7 @@ class COCODataset(IterableDataset):
             regionmasks.append(materialized_masks)
             
         imagebatch = torch.stack(images, dim=0)
+        cond_imagebatch = torch.stack(cond_images, dim=0)
         captionbatch = pad_sequence(captions, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         layeridsbatch = pad_sequence(layerids, batch_first=True, padding_value=-1)
         captiontypes = [(layerids_i > 0).long() for layerids_i in layerids]
@@ -293,10 +346,12 @@ class COCODataset(IterableDataset):
         # DONE: stack regionmasks to form one tensor (batsize, seqlen, H, W) per mask resolution
         # DONE: passing layer ids: prepare a data structure for converting from current dynamically flat caption format to (batsize, seqlen, hdim)
         # DONE: return (batsize, seqlen) tensor that specifies if the token is part of global description or local description
-        return {"image": imagebatch, 
-                "captions": captionbatch, 
+        # DONE: provide conditioning image for ControlNet
+        return {"image": rearrange(imagebatch, 'b c h w -> b h w c'), 
+                "cond_image": rearrange(cond_imagebatch, 'b c h w -> b h w c'),
+                "caption": captionbatch, 
                 "layerids": layeridsbatch, 
-                "regionmasks": regionmasks, 
+                "regionmasks": batched_regionmasks, 
                 "captiontypes": captiontypes}
     
 
@@ -324,10 +379,10 @@ class COCODataLoader(object):
         
     
 def main(x=0):
-    cocodataset = COCODataset(max_samples=1000)
+    cocodataset = COCODataset(max_samples=100)
     print(len(cocodataset))
     
-    dl = COCODataLoader(cocodataset, batch_size={384: 5, 448:4, 512: 4}, num_workers=4)
+    dl = COCODataLoader(cocodataset, batch_size={384: 5, 448:4, 512: 4}, num_workers=0)
     
     batch = next(iter(dl))
     # print(batch)
