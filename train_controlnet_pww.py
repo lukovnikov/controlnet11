@@ -1,8 +1,11 @@
 from copy import deepcopy
 from datetime import timedelta
 import json
+from pathlib import Path
+import random
 from typing import Any, Dict
 import cv2
+import fire
 import numpy as np
 import torch
 from torch import nn, einsum
@@ -17,11 +20,11 @@ from torch.utils.data import DataLoader
 from cldm.cldm import ControlLDM
 from cldm.logger import ImageLogger
 from cldm.model import create_model, load_state_dict
-from dataset import COCODataset, COCODataLoader
+from dataset import COCODataset, COCODataLoader, ProcessedCOCOExample
 from ldm.modules.attention import default
 from ldm.modules.diffusionmodules.util import torch_cat_nested
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
-from ldm.util import log_txt_as_img
+from ldm.util import SeedSwitch, log_txt_as_img
 
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
@@ -49,20 +52,20 @@ class CustomTextConditioning():
         self.controlonly = False
         self.controlledonly = False
         
-    def cross_attention_control(self, sim, numheads=1):
-        """ Takes the unscaled unnormalized attention scores computed by cross-attention module, returns adapted attention scores. """
-        wf = self.weight_func(sim)
+    # def cross_attention_control(self, sim, numheads=1):
+    #     """ Takes the unscaled unnormalized attention scores computed by cross-attention module, returns adapted attention scores. """
+    #     wf = self.weight_func(sim)
         
-        wf = wf[:, None].repeat(1, numheads, 1, 1)
-        wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
+    #     wf = wf[:, None].repeat(1, numheads, 1, 1)
+    #     wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
         
-        sim = sim + wf
-        return sim
+    #     sim = sim + wf
+    #     return sim
     
-    def weight_func(self, sim):
-        mask = self.cross_attn_masks[sim.shape[1]].to(sim.dtype)
-        ret = mask * sim.std() * self.strength
-        return ret
+    # def weight_func(self, sim):
+    #     mask = self.cross_attn_masks[sim.shape[1]].to(sim.dtype)
+    #     ret = mask * sim.std() * self.strength
+    #     return ret
     
     def flatten_inputs_for_gradient_checkpoint(self):
         flat_out = [self.embs]
@@ -88,6 +91,157 @@ class CustomTextConditioning():
         return ret
     
     
+class CustomCrossAttentionBase(nn.Module):
+    
+    @classmethod
+    def from_base(cls, m):
+        m.__class__ = cls
+        m.init_extra()
+        return m
+    
+    def weight_func(self, sim, context):
+        with torch.no_grad():
+            padmask = context.captiontypes >= 0
+            padmask = repeat(padmask, 'b j -> (b h) () j', h=sim.shape[0] // padmask.shape[0])
+            simstd = torch.masked_select(sim, padmask).std()
+            mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
+            ret = mask * simstd * context.strength
+        return ret
+    
+    def get_trainable_parameters(self):
+        pass    
+
+    
+class CustomCrossAttentionBaseline(CustomCrossAttentionBase):
+    # Tries to emulate the basic setting where only the global prompt is available, and attention computation is not changed.
+
+    def init_extra(self):
+        pass
+
+    def forward(self, x, context=None, mask=None):
+        h = self.heads
+        
+        if context is not None:
+            context = context["c_crossattn"][0]
+            contextembs = context.embs
+        else:
+            assert False        # this shouldn't be used as self-attention
+            contextembs = x
+            
+        q = self.to_q(x)
+        k = self.to_k(contextembs)
+        v = self.to_v(contextembs)
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        # force cast to fp32 to avoid overflowing
+        if _ATTN_PRECISION =="fp32":
+            with torch.autocast(enabled=False, device_type = 'cuda'):
+                q, k = q.float(), k.float()
+                sim = einsum('b i d, b j d -> b i j', q, k)
+        else:
+            sim = einsum('b i d, b j d -> b i j', q, k)
+        
+        del q, k
+
+        if mask is not None:
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+
+        if context is not None:     # cross-attention
+            sim = self.cross_attention_control(sim, context, numheads=h)
+        
+        # attention
+        sim = (sim * self.scale).softmax(dim=-1)
+
+        out = einsum('b i j, b j d -> b i d', sim, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        return self.to_out(out)
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        #apply mask on sim
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.captiontypes >= 0
+        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
+        sim.masked_fill_(~mask, max_neg_value)
+        """ Takes the unscaled unnormalized attention scores computed by cross-attention module, returns adapted attention scores. """
+        wf = self.weight_func(sim, context)
+        wf.masked_fill_(~context.global_prompt_mask[:, None, :], max_neg_value)
+        
+        wf = wf[:, None].repeat(1, numheads, 1, 1)
+        wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
+        
+        sim = sim + wf
+        return sim
+    
+    def get_trainable_parameters(self):
+        params = list(self.to_q.parameters())
+        params += list(self.to_k.parameters())
+        return params
+    
+    
+class DoubleCrossAttention(CustomCrossAttentionBase):
+    """ First applies trainable cross-attention using local descriptions and then regular frozen global attention"""
+    
+    @classmethod
+    def from_base(cls, m):
+        m.__class__ = cls
+        m.init_extra()
+        return m
+    
+    def init_extra(self):
+        self.local = deepcopy(self)     # this will be the trainable one
+    
+
+class CustomCrossAttentionBaselineBoth(CustomCrossAttentionBaseline):
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        #apply mask on sim
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.captiontypes >= 0
+        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
+        sim.masked_fill_(~mask, max_neg_value)
+        """ Takes the unscaled unnormalized attention scores computed by cross-attention module, returns adapted attention scores. """
+        wf = self.weight_func(sim, context)
+        
+        wf = wf[:, None].repeat(1, numheads, 1, 1)
+        wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
+        
+        sim = sim + wf
+        return sim
+    
+
+class CustomCrossAttentionBaselineLocal(CustomCrossAttentionBaseline):
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        #apply mask on sim
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.captiontypes >= 2
+        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
+        sim.masked_fill_(~mask, max_neg_value)
+        """ Takes the unscaled unnormalized attention scores computed by cross-attention module, returns adapted attention scores. """
+        wf = self.weight_func(sim, context)
+        
+        wf = wf[:, None].repeat(1, numheads, 1, 1)
+        wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
+        
+        sim = sim + wf
+        return sim
+    
+    
+class CustomCrossAttentionBaselineGlobal(CustomCrossAttentionBaseline):
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        #apply mask on sim
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = (context.captiontypes >= 0) & (context.captiontypes < 2)
+        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
+        sim.masked_fill_(~mask, max_neg_value)
+        return sim
+    
+        
 class TokenTypeEmbedding(torch.nn.Module):
     def __init__(self, embdim):
         super().__init__()
@@ -130,7 +284,7 @@ class ProgressEmbedding(torch.nn.Module):
         return ret
     
     
-class CustomCrossAttention(nn.Module):
+class CustomCrossAttentionExt(CustomCrossAttentionBase):
     # DONE: add model extension to be able to tell where is global and local parts of the prompt
         
     def init_extra(self):
@@ -138,12 +292,6 @@ class CustomCrossAttention(nn.Module):
         self.token_type_emb = TokenTypeEmbedding(self.to_k.in_features)
         # conditioning on progress (0..1)
         self.progress_emb = ProgressEmbedding(self.to_q.in_features)
-
-    @classmethod
-    def from_base(cls, m):
-        m.__class__ = CustomCrossAttention
-        m.init_extra()
-        return m
 
     def forward(self, x, context=None, mask=None):
         h = self.heads
@@ -181,7 +329,7 @@ class CustomCrossAttention(nn.Module):
             sim.masked_fill_(~mask, max_neg_value)
 
         if context is not None:     # cross-attention
-            sim = context.cross_attention_control(sim, numheads=h)
+            sim = self.cross_attention_control(sim, context, numheads=h)
         
         # attention
         sim = (sim * self.scale).softmax(dim=-1)
@@ -189,6 +337,148 @@ class CustomCrossAttention(nn.Module):
         out = einsum('b i j, b j d -> b i d', sim, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        #apply mask on sim
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.captiontypes >= 0
+        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
+        sim.masked_fill_(~mask, max_neg_value)
+        """ Takes the unscaled unnormalized attention scores computed by cross-attention module, returns adapted attention scores. """
+        wf = self.weight_func(sim, context)
+        
+        wf = wf[:, None].repeat(1, numheads, 1, 1)      # TODO: rewrite with einops
+        wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
+        
+        sim = sim + wf
+        return sim
+    
+    def get_trainable_parameters(self):
+        params = list(self.to_q.parameters())
+        params += list(self.to_k.parameters())
+        params += list(self.token_type_emb.parameters())
+        params += list(self.progress_emb.parameters())
+        return params
+    
+        
+class TokenTypeEmbeddingMinimal(torch.nn.Module):
+    def __init__(self, embdim):
+        super().__init__()
+        self.emb = torch.nn.Embedding(10, embdim)
+        
+    def forward(self, tokentypes):
+        tokentypeemb = self.emb(tokentypes.clamp_min(0))
+        return tokentypeemb
+    
+    
+class ProgressEmbeddingMinimal(torch.nn.Module):
+    def __init__(self, embdim) -> None:
+        super().__init__()
+        self.progress_emb = torch.nn.Sequential(
+            torch.nn.Linear(1, embdim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(embdim, embdim)
+        )
+        # self.gateA = torch.nn.Parameter(torch.randn(embdim) * 1e-3)
+        
+    def forward(self, progress):
+        progressemb = self.progress_emb(progress)
+        return progressemb
+    
+    
+class CustomCrossAttentionMinimal(CustomCrossAttentionExt):
+    # Minimal cross attention: computes scores based on content independently from scores based on progress and region
+    
+    def init_extra(self):
+        # conditioning on token type (global BOS, global or local)
+        self.token_type_emb = TokenTypeEmbeddingMinimal(self.to_k.out_features)
+        # conditioning on progress (0..1)
+        self.progress_emb = ProgressEmbeddingMinimal(self.to_q.out_features)
+        # gate parameters: one trainable scalar for every head in this attention layer
+        self.gate = torch.nn.Parameter(torch.randn(self.heads) * 1e-3)      # 
+        
+    def forward(self, x, context=None, mask=None):
+        h = self.heads
+        
+        if context is not None:
+            context = context["c_crossattn"][0]
+            contextembs = context.embs
+        else:
+            assert False        # this shouldn't be used as self-attention
+            contextembs = x
+            
+        q = self.to_q(x)
+        k = self.to_k(contextembs)
+        v = self.to_v(contextembs)
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        # force cast to fp32 to avoid overflowing
+        if _ATTN_PRECISION =="fp32":
+            with torch.autocast(enabled=False, device_type = 'cuda'):
+                q, k = q.float(), k.float()
+                sim = einsum('b i d, b j d -> b i j', q, k)
+        else:
+            sim = einsum('b i d, b j d -> b i j', q, k)
+        
+        del q, k
+
+        if mask is not None:
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+
+        if context is not None:     # cross-attention
+            sim = self.cross_attention_control(sim, context, numheads=h)
+        
+        # attention
+        sim = (sim * self.scale).softmax(dim=-1)
+
+        out = einsum('b i j, b j d -> b i d', sim, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        return self.to_out(out)
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        #apply mask on sim
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.captiontypes >= 0
+        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
+        sim.masked_fill_(~mask, max_neg_value)
+        
+        # compute additional attention
+        typeemb = self.token_type_emb(context.captiontypes)
+        progressemb = self.progress_emb(context.progress[:, None, None])
+        
+        q_cas, k_cas = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=numheads), (progressemb, typeemb))
+        # force cast to fp32 to avoid overflowing
+        if _ATTN_PRECISION =="fp32":
+            with torch.autocast(enabled=False, device_type = 'cuda'):
+                q_cas, k_cas = q_cas.float(), k_cas.float()
+                sim_cas = einsum('b i d, b j d -> b i j', q_cas, k_cas)
+        else:
+            sim_cas = einsum('b i d, b j d -> b i j', q_cas, k_cas)
+        del q_cas, k_cas
+        sim_cas.masked_fill_(~mask, max_neg_value)
+        
+        # add sim_cas to sim using gate
+        g = self.gate.repeat(sim.shape[0] // numheads)[:, None, None]
+        sim = sim + sim_cas * g
+        
+        """ Takes the unscaled unnormalized attention scores computed by cross-attention module, returns adapted attention scores. """
+        wf = self.weight_func(sim, context)
+        
+        wf = wf[:, None].repeat(1, numheads, 1, 1)
+        wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
+        
+        sim = sim + wf
+        return sim
+    
+    def get_trainable_parameters(self):
+        params = list(self.token_type_emb.parameters())
+        params += list(self.progress_emb.parameters())
+        params += [self.gate]
+        return params
 
 
 class ControlPWWLDM(ControlLDM):
@@ -319,11 +609,8 @@ class ControlPWWLDM(ControlLDM):
         params = []
         # select query and key projections as well as new modules from CustomCrossAttention
         for module in self.modules():
-            if isinstance(module, CustomCrossAttention):
-                params += list(module.to_q.parameters())
-                params += list(module.to_k.parameters())
-                params += list(module.token_type_emb.parameters())
-                params += list(module.progress_emb.parameters())
+            if isinstance(module, CustomCrossAttentionBase):
+                params += list(module.get_trainable_parameters())
                 
         for param in params:
             param.store_param = True
@@ -360,36 +647,54 @@ class ControlPWWLDM(ControlLDM):
         # DONE: filter state dict to save only those parameters that have been trained
 
     @torch.no_grad()
-    def get_uncond_batch(self, batch):
-        uncond_cond = deepcopy(batch)      # DONE: change all prompts to "" and re-tokenize
+    def get_uncond_batch(self, batch):      # DONE: change regionmasks to fit new prompts
+        uncond_cond = deepcopy(batch)       # DONE: change all prompts to "" and re-tokenize
         bos, eos = self.cond_stage_model.tokenizer.bos_token_id, self.cond_stage_model.tokenizer.pad_token_id
-        new_caption = [[] for _ in range(batch["caption"].shape[0])]
-        new_layerids = [[] for _ in new_caption]
-        new_captiontypes = [[] for _ in new_caption]
-        device = batch["caption"].device
+        
+        # new_caption = [[] for _ in range(batch["caption"].shape[0])]
+        # new_layerids = [[] for _ in new_caption]
+        # new_captiontypes = [[] for _ in new_caption]
+        
+        new_caption2 = torch.ones_like(batch["caption"]) * eos
+        new_layerids2 = torch.ones_like(batch["layerids"]) * -1
+        new_captiontypes2 = torch.ones_like(batch["captiontypes"]) * -1
+        
+        new_regionmasks = {k: torch.zeros_like(v) for k, v in batch["regionmasks"].items()}
+        # device = batch["caption"].device
         caption = batch["caption"].cpu()
-        layerids = batch["layerids"].cpu()
-        captiontypes = batch["captiontypes"].cpu()
+        
+        # layerids = batch["layerids"].cpu()
+        # captiontypes = batch["captiontypes"].cpu()
+        
         prev = None
         for i in range(len(caption)):
+            k = 0
             for j in range(len(caption[0])):
                 cur = caption[i, j].item()
                 if cur == bos or (cur == eos and prev != eos):
-                    new_caption[i].append(cur)
-                    new_layerids[i].append(layerids[i, j].item())
-                    new_captiontypes[i].append(captiontypes[i, j].item())
+                    # new_caption[i].append(cur)
+                    # new_layerids[i].append(layerids[i, j].item())
+                    # new_captiontypes[i].append(captiontypes[i, j].item())
+                    new_caption2[i, k] = batch["caption"][i, j]
+                    new_layerids2[i, k] = batch["layerids"][i, j]
+                    new_captiontypes2[i, k] = batch["captiontypes"][i, j]
+                    for res in new_regionmasks:
+                        new_regionmasks[res][i, k] = batch["regionmasks"][res][i, j]
+                    k += 1
                 prev = cur
-        maxlen = caption.shape[1]
-        for i in range(len(new_caption)):
-            while len(new_caption[i]) < maxlen:
-            # for j in range(len(new_caption[i]), maxlen):
-                new_caption[i].append(eos)
-                new_layerids[i].append(-1)
-                new_captiontypes[i].append(-1)
                 
-        uncond_cond["caption"] = torch.tensor(new_caption).to(device)
-        uncond_cond["layerids"] = torch.tensor(new_layerids).to(device)
-        uncond_cond["captiontypes"] = torch.tensor(new_captiontypes).to(device)
+        # maxlen = caption.shape[1]
+        # for i in range(len(new_caption)):
+        #     while len(new_caption[i]) < maxlen:
+        #     # for j in range(len(new_caption[i]), maxlen):
+        #         new_caption[i].append(eos)
+        #         new_layerids[i].append(-1)
+        #         new_captiontypes[i].append(-1)
+                
+        uncond_cond["caption"] = new_caption2  #torch.tensor(new_caption).to(device)
+        uncond_cond["layerids"] = new_layerids2  #torch.tensor(new_layerids).to(device)
+        uncond_cond["captiontypes"] = new_captiontypes2  #torch.tensor(new_captiontypes).to(device)
+        uncond_cond["regionmasks"] = new_regionmasks
                 
         return uncond_cond
     
@@ -406,8 +711,8 @@ class ControlPWWLDM(ControlLDM):
         z, c = self.get_input(batch, self.first_stage_key, bs=N)
         c_cat, c = c["c_concat"][0], c["c_crossattn"][0]
         # N = min(z.shape[0], N)
-        log["reconstruction"] = self.decode_first_stage(z)
-        log["control"] = c_cat * 2.0 - 1.0
+        log["reconstruction"] = reconstrimg = self.decode_first_stage(z)  #.clamp(0, 1) * 2.0 - 1.0
+        log["control"] = controlimg = c_cat * 2.0 - 1.0
         # log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
 
         if plot_diffusion_rows:
@@ -452,27 +757,91 @@ class ControlPWWLDM(ControlLDM):
                                              unconditional_conditioning=uc_full,
                                              )
             x_samples_cfg = self.decode_first_stage(samples_cfg)
-            log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
+            log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = generated_img = x_samples_cfg
+            
+        log[f"all"] = torch.cat([reconstrimg, controlimg, generated_img], 2)
+        del log["reconstruction"]
+        del log["control"]
+        del log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"]
 
         return log
     
+
+class ControlPWWLDMSimpleEncode(ControlPWWLDM):
     
-def convert_model(model):
+    def get_learned_conditioning(self, cond):   return self.get_learned_conditioning_simple(cond)
+    
+    def get_learned_conditioning_simple(self, cond):
+        # takes conditioning info (cond_key) and preprocesses it to later be fed into LDM
+        # returns CustomTextConditioning object
+        # called from get_input()
+        # must be used with cond_key = "all", then get_input() passes the batch as-is in here
+        # DONE: unpack texts, embed them, pack back up and package with cross-attention masks
+        
+        # this is a non-parallelized implementation
+        with torch.no_grad():
+            tokenids = cond["caption"]
+            layerids = cond["layerids"]
+             
+            # 2. encode using text encoder
+            outputs = self.cond_stage_model.transformer(input_ids=tokenids, output_hidden_states=self.cond_stage_model.layer=="hidden")
+            if self.cond_stage_model.layer == "last":
+                text_emb = outputs.last_hidden_state
+            elif self.cond_stage_model.layer == "pooled":
+                text_emb = outputs.pooler_output[:, None, :]
+            else:
+                text_emb = outputs.hidden_states[self.layer_idx]
+            
+        global_prompt_mask = cond["captiontypes"] < 2
+        global_bos_eos_mask = cond["captiontypes"] == 0
+        
+        ret = CustomTextConditioning(embs=text_emb,
+                                     layer_ids=layerids,
+                                     token_ids=tokenids,
+                                     global_prompt_mask=global_prompt_mask,
+                                     global_bos_eos_mask=global_bos_eos_mask)
+        
+        ret.captiontypes = cond["captiontypes"]
+        
+        cross_attn_masks = cond["regionmasks"]    
+        cross_attn_masks = {res[0] * res[1]: mask.view(mask.size(0), mask.size(1), -1).transpose(1, 2) for res, mask in cross_attn_masks.items() if res[0] <= 64}
+        ret.cross_attn_masks = cross_attn_masks
+        return ret
+    
+    
+def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simpleencode=False):
     model.__class__ = ControlPWWLDM
+    if simpleencode:
+        model.__class__ = ControlPWWLDMSimpleEncode
     model.first_stage_key = "image"
     model.control_key = "cond_image"
     model.cond_stage_key = "all"
+    
+    if cas_name is not None:
+        assert cas_class is None
+        cas_class = {"both": CustomCrossAttentionBaselineBoth,
+                     "local": CustomCrossAttentionBaselineLocal,
+                     "global": CustomCrossAttentionBaselineGlobal,
+                     "bothext": CustomCrossAttentionExt,
+                     "bothminimal": CustomCrossAttentionMinimal,
+                     "doublecross": CustomCrossAttentionBaselineGlobal}[cas_name]
+        
+    if cas_class is None:
+        cas_class = CustomCrossAttentionBaseline
+        
+    print(f"CAS name: {cas_name}")
+    print(f"CAS class: {cas_class}")
     
     # DONE: replace CrossAttentions that are at attn2 in BasicTransformerBlocks with adapted CustomCrossAttention that takes into account cross-attention masks
     for module in model.model.diffusion_model.modules():
         if module.__class__.__name__ == "BasicTransformerBlock":
             assert not module.disable_self_attn
-            module.attn2 = CustomCrossAttention.from_base(module.attn2)
+            module.attn2 = cas_class.from_base(module.attn2)
             
     for module in model.control_model.modules():
         if module.__class__.__name__ == "BasicTransformerBlock":
             assert not module.disable_self_attn
-            module.attn2 = CustomCrossAttention.from_base(module.attn2)
+            module.attn2 = cas_class.from_base(module.attn2)
     
     return model
 
@@ -497,7 +866,8 @@ def get_checkpointing_callbacks(interval=6*60*60, dirpath=None):
     return [interval_checkpoint, latest_checkpoint]
 
 
-def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='control_v11p_sd15_seg'):
+def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='control_v11p_sd15_seg', cas_name="bothext",
+                                freezedown=False, simpleencode=False):
     # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
     model = create_model(f'./models/{model_name}.yaml').cpu()
     # load main weights
@@ -507,49 +877,127 @@ def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='co
     model.base_model_name = basemodelname
     model.controlnet_model_name = model_name
     
-    model = convert_model(model)
+    model = convert_model(model, cas_name=cas_name, freezedown=freezedown, simpleencode=simpleencode)
     return model
 
 
-def main(batsize=4,
-         version="v1"):
+def main(batsize=5,
+         version="v1",
+         cas="doublecross",  # "both", "local", "global", "bothext", "bothminimal", "doublecross"
+         devices=(0,),
+         numtrain=-1,
+         forreal=False,
+         seed=12345,        # seed for training
+         log_image_seed=41,     # seed for generating logging images
+         freezedown=False,      # don't adapt the down-sampling blocks of the Unet, only change and train the upsamling blocks
+         simpleencode=False,    # encode both global and all local prompts as one sequence
+        #  minimal=False,         # only interaction between layer+head info, progress and token type (global/local/bos) (<-- essentially a learned schedule for CAS, independent of content)
+         ):  
+    args = locals().copy()
+    print(json.dumps(args, indent=4))     
+    ### usage
+    # simpleencode=True: only makes sense with both or bothext
+    if simpleencode:
+        assert cas in ("bothext", "bothminimal")
+    print(devices, type(devices), devices[0])
     # Configs
     batch_size = batsize
-    logger_freq = 1 #300
+    logger_freq = 1000 if forreal else 10 #300
     learning_rate = 1e-5
     sd_locked = False
     
+    numtrain = None if numtrain == -1 else numtrain
+    
     # check dataloader
-    ds = COCODataset(split="valid", max_samples=100)
-    dl = COCODataLoader(ds, batch_size={384: round(batch_size * 1.2), 448:batch_size, 512: batch_size}, num_workers=batch_size+2)
+    # ds = COCODataset(split="train" if forreal else "valid", cas=cas, simpleencode=simpleencode, 
+    #                  max_samples=numtrain if numtrain is not None else (None if forreal else 250))
+    if forreal:
+        ds = COCODataset.from_cache("coco2017.train.cached", casmode=cas, simpleencode=simpleencode)
+    else:
+        ds = COCODataset.from_cache("coco2017.valid.cached", casmode=cas, simpleencode=simpleencode)
+    print(len(ds))
+    batsizes = {384: round(batch_size * 2.4), 448:round(batch_size * 1.4), 512: batch_size}
+    print(f"Batch sizes: {batsizes}")
+    dl = COCODataLoader(ds, batch_size=batsizes, 
+                        num_workers=max(batsizes.values()),
+                        shuffle=True)
+    
+    # valid_ds = COCODataset(split="valid", max_samples=600, min_size=512, cas=cas, simpleencode=simpleencode)
+    valid_ds = COCODataset.from_cache("coco2017.valid.cached", casmode=cas, simpleencode=simpleencode)
+    valid_dl = COCODataLoader(valid_ds, batch_size=4, num_workers=batsize, shuffle=False)
 
-    model = create_controlnet_pww_model()
+    model = create_controlnet_pww_model(cas_name=cas, freezedown=freezedown, simpleencode=simpleencode)
 
     model.learning_rate = learning_rate
     model.sd_locked = sd_locked
 
     # Misc
-    logger = ImageLogger(batch_frequency=logger_freq)
-    checkpoints = get_checkpointing_callbacks(interval=60, dirpath=f"coco_checkpoints_{version}/")
-    trainer = pl.Trainer(accelerator="gpu", devices=[0], precision=32, 
-                         callbacks=checkpoints + [logger])
+    expnr = 1
+    
+    def get_exp_name(_expnr):
+        ret = f"checkpoints_coco_{cas}_{version}_exp_{_expnr}{'_forreal' if forreal else ''}"
+        if freezedown:
+            ret += "_freezedown"
+        if simpleencode:
+            ret += "_simpleencode"
+        return ret
+    
+    exppath = Path(get_exp_name(expnr))
+    while exppath.exists():
+        expnr += 1
+        exppath = Path(get_exp_name(expnr))
+        
+    print(f"Writing to {exppath}")
+        
+    checkpoints = get_checkpointing_callbacks(interval=8*60*60 if forreal else 60*10, dirpath=exppath)
+    seedswitch = SeedSwitch(seed, log_image_seed)
+    image_logger = ImageLogger(batch_frequency=logger_freq, dl=valid_dl, seed=seedswitch)
+    logger = pl.loggers.TensorBoardLogger(save_dir=exppath)
+    
+    trainer = pl.Trainer(accelerator="gpu", devices=devices, 
+                         precision=32, 
+                         logger=logger,
+                         callbacks=checkpoints + [image_logger])
 
     # Train!
     trainer.fit(model, dl)
     
     
 if __name__ == "__main__":
-    main()
+    fire.Fire(main)
     
     # DONE: implement conditioning on which prompt type a token is and also on progress in CustomCrossAttention
     # DONE: implement weight function in CustomTextConditioning
     # DONE: select the right parameters to train (all the CustomCrossAttentions at first)
-    # TODO: implement generation of images (log_images())
-    #   TODO: adapt get_unconditional_conditioning()
+    # DONE: implement generation of images (log_images())
     # DONE: implement checkpointing
     #   DONE: save only the changed parameters
     #   DONE: test checkpointing
     # DONE: how to handle negative prompt? --> replace prompt of all regions and global prompt with ""
+    # DONE: check if everything works as expected
+    # DONE: check how just global prompt works without any changes (CustomAttentionBaseline)
     
+    # DONE: why are images looking washed out? loss intended for -1:1 range has 0:1 range targets?
+    # DONE: log the same images throughout the training process
+    # WONTDOTODO: create variant where we change only the mid and upsampling blocks <-- probably not necessary
     
+    # DONE: create variant where we encode global and local prompts together as one prompt passing through encoder as one sequence (instead of separately)
+    # DONE: create minimal variant where there is only interaction between layer+head info, progress and token type (global/local/bos) (<-- essentially a learned schedule for CAS, independent of content)
+    # WONTDOFORNOWTODO: create variant that combines regular and simple encode
+    
+    # TODO: train CAS better by dropping out the ControlNet control (because ControlNet already implies some object identity with its shapes)
+    
+    # TODO: IDEA: double-cross-attention: one cross attention on global prompt (unchanged, untrained?), and another cross-attention on local prompts
+    
+    # TODO: validation setup: take images of apples and oranges and of cats and dogs and change where the cats and dogs and apples and oranges are
+    
+    # TODO: evaluation setup --> RegionCLIP?
+    
+    # COCO: Interesting test examples:
+    # 152353, 577451, 326390, 265531, 494550  (oranges)      <-- round things
+    # 289170, 513424, 415222 (apples)                        <-- round things
+    # 303308, 86408, 315645 (microwave)                      <-- boxy things
+    # 56886, 285258, 385186, 387876, 268726, 475663 (dog)            <-- animal things
+    # 401758, 228764, 460872, 524594            <--- cat and dog
+    # 572448, 543192, 25411, 42641      <-- apples and oranges
     
