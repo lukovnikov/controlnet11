@@ -491,7 +491,7 @@ class CustomCrossAttentionMinimal(CustomCrossAttentionExt):
         # conditioning on progress (0..1)
         self.progress_emb = ProgressEmbeddingMinimal(self.to_q.out_features)
         # gate parameters: one trainable scalar for every head in this attention layer
-        self.gate = torch.nn.Parameter(torch.randn(self.heads) * 1e-3)      # 
+        self.gate = torch.nn.Parameter(torch.randn(self.heads) * 1e-6)      # 
         
         for p in self.get_trainable_parameters():
             p.train_param = True
@@ -547,9 +547,9 @@ class CustomCrossAttentionMinimal(CustomCrossAttentionExt):
     def cross_attention_control(self, sim, context, numheads=None):
         #apply mask on sim
         max_neg_value = -torch.finfo(sim.dtype).max
-        mask = context.captiontypes >= 0
-        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
-        sim.masked_fill_(~mask, max_neg_value)
+        # mask = context.captiontypes >= 0
+        # mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
+        # sim.masked_fill_(~mask, max_neg_value)
         
         # compute additional attention
         typeemb = self.token_type_emb(context.captiontypes)
@@ -564,11 +564,11 @@ class CustomCrossAttentionMinimal(CustomCrossAttentionExt):
         else:
             sim_cas = einsum('b i d, b j d -> b i j', q_cas, k_cas)
         del q_cas, k_cas
-        sim_cas.masked_fill_(~mask, max_neg_value)
+        # sim_cas.masked_fill_(~mask, max_neg_value)
         
         # add sim_cas to sim using gate
         g = self.gate.repeat(sim.shape[0] // numheads)[:, None, None]
-        sim = sim + sim_cas * g
+        sim = sim + sim_cas * torch.tanh(g)
         
         """ Takes the unscaled unnormalized attention scores computed by cross-attention module, returns adapted attention scores. """
         wf = self.weight_func(sim, context)
@@ -576,7 +576,8 @@ class CustomCrossAttentionMinimal(CustomCrossAttentionExt):
         wf = wf[:, None].repeat(1, numheads, 1, 1)
         wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
         
-        sim = sim + wf
+        sim.masked_fill_(wf == 0, max_neg_value)
+        # sim = sim + wf
         return sim
 
 
@@ -995,7 +996,7 @@ def main(batsize=5,
          version="v2",
          datadir="/USERSPACE/lukovdg1/coco2017/",
          devexamples="coco2017.4dev.examples.pkl",
-         cas="doublecross",  # "both", "local", "global", "bothext", "bothminimal", "doublecross"
+         cas="bothminimal",  # "both", "local", "global", "bothext", "bothminimal", "doublecross"
          devices=(0,),
          numtrain=-1,
          forreal=False,
@@ -1004,6 +1005,7 @@ def main(batsize=5,
          freezedown=False,      # don't adapt the down-sampling blocks of the Unet, only change and train the upsamling blocks
          simpleencode=False,    # encode both global and all local prompts as one sequence
         #  minimal=False,         # only interaction between layer+head info, progress and token type (global/local/bos) (<-- essentially a learned schedule for CAS, independent of content)
+         generate=True,
          ):  
     args = locals().copy()
     print(json.dumps(args, indent=4))     
@@ -1020,16 +1022,20 @@ def main(batsize=5,
     
     numtrain = None if numtrain == -1 else numtrain
     
-    # check dataloader
-    ds = COCOPanopticDataset(maindir=datadir, split="train" if forreal else "valid", casmode=cas, simpleencode=simpleencode, 
-                     max_samples=numtrain if numtrain is not None else (None if forreal else 1000))
-    
-    print(len(ds))
-    batsizes = {384: round(batch_size * 2.4), 448:round(batch_size * 1.4), 512: batch_size}
-    print(f"Batch sizes: {batsizes}")
-    dl = COCODataLoader(ds, batch_size=batsizes, 
-                        num_workers=max(batsizes.values()),
-                        shuffle=True)
+    expnr = 1
+    def get_exp_name(_expnr):
+            ret = f"checkpoints/{version}/checkpoints_coco_{cas}_{version}_exp_{_expnr}{'_forreal' if forreal else ''}"
+            if freezedown:
+                ret += "_freezedown"
+            if simpleencode:
+                ret += "_simpleencode"
+            return ret
+        
+    exppath = Path(get_exp_name(expnr))
+    while exppath.exists():
+        expnr += 1
+        exppath = Path(get_exp_name(expnr))
+        
     
     # load dev set from pickle
     with open(devexamples, "rb") as f:
@@ -1037,42 +1043,46 @@ def main(batsize=5,
     # override pickled defaults
     valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas, simpleencode=simpleencode)
     valid_dl = COCODataLoader(valid_ds, batch_size=4, num_workers=4, shuffle=False)
-
+    
     model = create_controlnet_pww_model(cas_name=cas, freezedown=freezedown, simpleencode=simpleencode)
-
-    model.learning_rate = learning_rate
-    model.sd_locked = sd_locked
-
-    # Misc
-    expnr = 1
     
-    def get_exp_name(_expnr):
-        ret = f"checkpoints/{version}/checkpoints_coco_{cas}_{version}_exp_{_expnr}{'_forreal' if forreal else ''}"
-        if freezedown:
-            ret += "_freezedown"
-        if simpleencode:
-            ret += "_simpleencode"
-        return ret
-    
-    exppath = Path(get_exp_name(expnr))
-    while exppath.exists():
-        expnr += 1
-        exppath = Path(get_exp_name(expnr))
-        
-    print(f"Writing to {exppath}")
-        
-    checkpoints = get_checkpointing_callbacks(interval=8*60*60 if forreal else 60*10, dirpath=exppath)
     seedswitch = SeedSwitch(seed, log_image_seed)
     image_logger = ImageLogger(batch_frequency=logger_freq, dl=valid_dl, seed=seedswitch)
+        
+    ds = COCOPanopticDataset(maindir=datadir, split="train" if forreal else "valid", casmode=cas, simpleencode=simpleencode, 
+                    max_samples=numtrain if numtrain is not None else (None if forreal else 1000))
+    
+    print(len(ds))
+    batsizes = {384: round(batch_size * 2.4), 448:round(batch_size * 1.4), 512: batch_size}
+    print(f"Batch sizes: {batsizes}")
+    dl = COCODataLoader(ds, batch_size=batsizes, 
+                        num_workers=max(batsizes.values()),
+                        shuffle=True)
+
+    model.learning_rate = learning_rate if not generate else 0
+    model.sd_locked = sd_locked
+        
+    checkpoints = get_checkpointing_callbacks(interval=8*60*60 if forreal else 60*10, dirpath=exppath)
     logger = pl.loggers.TensorBoardLogger(save_dir=exppath)
     
+    max_steps = -1
+    if generate:
+        max_steps = 1
+    
     trainer = pl.Trainer(accelerator="gpu", devices=devices, 
-                         precision=32, 
-                         logger=logger,
-                         callbacks=checkpoints + [image_logger])
+                        precision=32, max_steps=max_steps,
+                        logger=logger,
+                        callbacks=checkpoints + [image_logger])
 
     # Train!
+    print(f"Writing to {exppath}")
     trainer.fit(model, dl)
+    
+    # # generate
+    # device = torch.device("cuda", devices[0])
+    # print("device", device)
+    # model = model.to(device)
+    # image_logger.log_img(model, None, 0, split="dev")
     
     
 if __name__ == "__main__":
@@ -1099,7 +1109,6 @@ if __name__ == "__main__":
     
     # TODO: train CAS better by dropping out the ControlNet control (because ControlNet already implies some object identity with its shapes)
     
-    
     # TODO: IDEA: double-cross-attention: one cross attention on global prompt (unchanged, untrained?), and another cross-attention on local prompts
     
     # DONE: validation setup: take images of apples and oranges and of cats and dogs and change where the cats and dogs and apples and oranges are
@@ -1115,4 +1124,6 @@ if __name__ == "__main__":
     # 56886, 285258, 385186, 387876, 268726, 475663 (dog)            <-- animal things
     # 401758, 228764, 460872, 524594            <--- cat and dog
     # 572448, 543192, 25411, 42641      <-- apples and oranges
+    
+    # DONE: implement clean global cas here
     
