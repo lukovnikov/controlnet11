@@ -91,7 +91,7 @@ class COCODatasetSubset(Dataset):
         return self.mainds.materialize_example(self.examples[index])
         
 
-class COCODataset(IterableDataset):
+class  COCODataset(IterableDataset):
     def __init__(self, split="valid", maxmasks=20, max_samples=None, shuffle=False, min_size=350,
                  captionpath="/USERSPACE/lukovdg1/controlnet11/coco/annotations/", cas=None, simpleencode=False,
                  tokenizer_version="openai/clip-vit-large-patch14", filterids=None, dataset_name=None):
@@ -767,9 +767,9 @@ class COCOPanopticDataset(IterableDataset):
             setattr(self, k, v)
         self.load_tokenizer()
         
-    def tokenize(self, x, tokenizer=None):
+    def tokenize(self, x, tokenizer=None, minimize_length=True):
         tokenizer = tokenizer if tokenizer is not None else self.tokenizer
-        tokenized = tokenizer(x,  # padding="max_length",
+        tokenized = tokenizer(x,  padding="max_length" if not minimize_length else "do_not_pad",
                                   max_length=tokenizer.model_max_length,
                                   return_overflowing_tokens=False,
                                   truncation=True,
@@ -897,16 +897,18 @@ class COCOPanopticDataset(IterableDataset):
         
         # 4. pick one caption at random (TODO: or generate one from regions)
         captions = [random.choice(example.captions)]
-        
+    
         # 4. load masks
         masks = [torch.ones_like(imgtensor[0], dtype=torch.bool)]
         # get the captions of the regions and build layer ids
+        
         for i, (region_code, region_info) in enumerate(example.seg_info.items()):
-            captions.append(region_info["caption"])
             
             rgb = torch.tensor(region_code_to_rgb(region_code))
             region_mask = (seg_imgtensor == rgb[:, None, None]).all(0)
-            masks.append(region_mask)
+            if self.casmode != "global":
+                captions.append(region_info["caption"])
+                masks.append(region_mask)
             
             randomcolor = torch.tensor(randomcolor_hsv())
             maskcolor = region_mask.unsqueeze(0).repeat(3, 1, 1) * randomcolor[:, None, None]
@@ -919,7 +921,8 @@ class COCOPanopticDataset(IterableDataset):
             comma = self.tokenize([","])[0, 1:-1]
             
         # encode separately
-        captions = [self.tokenize(caption)[0] for caption in captions]
+        captions = [self.tokenize(caption, minimize_length=self.casmode != "global")[0] 
+                    for caption in captions]
         layerids = []
         for i, caption in enumerate(captions):
             layerids.append(torch.ones_like(caption) * i)
@@ -952,7 +955,7 @@ class COCOPanopticDataset(IterableDataset):
                 
             if self.simpleencode:
                 assert self.casmode != "doublecross"
-                captions, layerids = [ret_captions], [ret_captions]
+                captions, layerids = [ret_captions], [ret_layerids]
             elif self.casmode == "doublecross":
                 captions[0], layerids[0] = ret_captions, (torch.zeros_like(ret_layerids))
 

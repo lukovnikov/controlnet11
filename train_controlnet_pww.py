@@ -256,6 +256,50 @@ class CustomCrossAttentionBaselineLocalGlobalFallback(CustomCrossAttentionBaseli
         # sim = sim + wf
         return sim
     
+
+class CustomCrossAttentionSepSwitch(CustomCrossAttentionBaseline):
+    threshold = 0.2
+    """ Uses only local descriptions, unless there is none (all local ones are masked), then falls back to global description."""
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        # compute mask that ignores everything except the local descriptions
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.captiontypes >= 2
+        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
+        
+        # get mask that selects global as well as applicable local prompt
+        wf = self.weight_func(sim, context, sim_mask=mask)
+
+        # expand dimensions to match heads
+        wf = wf[:, None].repeat(1, numheads, 1, 1)
+        wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
+        
+        # remove the global part from the mask
+        wf.masked_fill_(~mask, 0)  # max_neg_value)
+        # determine where to use global mask (where no local descriptions are available)
+        useglobal = wf.sum(-1) == 0
+        
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        wfmaxes = wf.max(-1, keepdim=True)[0]
+        wf = (wf >= (wfmaxes.clamp_min(1e-3) - 1e-4)).float()
+        
+        # get mask that selects only global tokens
+        gmask = (context.captiontypes >= 0) & (context.captiontypes < 2)
+        gmask = repeat(gmask, 'b j -> (b h) () j', h=numheads)
+        
+        # update stimulation to attend to global tokens when no local tokens are available
+        lmask = wf + (useglobal[:, :, None] & gmask)
+        
+        prog = context.progress
+        prog = prog[:, None].repeat(1, self.heads).view(-1)
+        lorg = prog <= self.threshold
+        
+        mask = torch.where(lorg[:, None, None], lmask, gmask)
+        
+        sim.masked_fill_(mask == 0, max_neg_value)
+        # sim = sim + wf
+        return sim
+    
     
 class CustomCrossAttentionBaselineGlobal(CustomCrossAttentionBaseline):
     
@@ -482,24 +526,66 @@ class ProgressEmbeddingMinimal(torch.nn.Module):
         return progressemb
     
     
+class DiscretizedProgressEmbed(torch.nn.Module):
+    def __init__(self, embdim, embeds=50, steps=1000) -> None:
+        super().__init__()
+        self.embdim, self.embeds, self.steps = embdim, embeds, steps
+        self.emb1 = torch.nn.Embedding(embeds+1, embdim)
+        self.emb2 = torch.nn.Embedding(steps // embeds, embdim)
+        
+    def forward(self, x):
+        # if torch.any(x == 1.):
+        #     print("x contains a 1")
+        xstep = (x * self.steps).round().long().clamp_max(self.steps-1)
+        x1 = torch.div(xstep, (self.steps // self.embeds) , rounding_mode="floor")
+        x2 = xstep % (self.steps // self.embeds)
+        emb1 = self.emb1(x1)
+        emb2 = self.emb2(x2)
+        return emb1 + emb2
+    
+    
+class ProgressClassifier(torch.nn.Module):      # classifies whether to use global prompt or local prompt for every head given progress
+    INITBIAS = -3
+    def __init__(self, embdim=512, numheads=8) -> None:
+        super().__init__()
+        self.embdim, self.numheads, self.numclasses = embdim, numheads, 2
+        self.net = torch.nn.Sequential(
+            DiscretizedProgressEmbed(embdim),
+            torch.nn.GELU(),
+            torch.nn.Linear(embdim, embdim),
+            torch.nn.GELU(),
+            torch.nn.Linear(embdim, self.numclasses * numheads)
+        )
+        finalbias = self.net[-1].bias
+        classbias = torch.tensor([0, self.INITBIAS]).repeat(finalbias.shape[0]//2)
+        finalbias.data += classbias
+        
+    def forward(self, progress):
+        out = self.net(progress)        # maps (batsize, 1) to (batsize, numclases * numheads)
+        probs = out.view(out.shape[0], self.numheads, self.numclasses).softmax(-1)
+        return probs
+    
+    
 class CustomCrossAttentionMinimal(CustomCrossAttentionExt):
     # Minimal cross attention: computes scores based on content independently from scores based on progress and region
     
     def init_extra(self):
-        # conditioning on token type (global BOS, global or local)
-        self.token_type_emb = TokenTypeEmbeddingMinimal(self.to_k.out_features)
-        # conditioning on progress (0..1)
-        self.progress_emb = ProgressEmbeddingMinimal(self.to_q.out_features)
-        # gate parameters: one trainable scalar for every head in this attention layer
-        self.gate = torch.nn.Parameter(torch.randn(self.heads) * 1e-6)      # 
+        self.progressclassifier = ProgressClassifier(numheads=self.heads)
+        # # conditioning on token type (global BOS, global or local)
+        # self.token_type_emb = TokenTypeEmbeddingMinimal(self.to_k.out_features)
+        # # conditioning on progress (0..1)
+        # self.progress_emb = ProgressEmbeddingMinimal(self.to_q.out_features)
+        # # gate parameters: one trainable scalar for every head in this attention layer
+        # self.gate = torch.nn.Parameter(torch.randn(self.heads) * 1e-6)      # 
         
         for p in self.get_trainable_parameters():
             p.train_param = True
         
     def get_trainable_parameters(self):
-        params = list(self.token_type_emb.parameters())
-        params += list(self.progress_emb.parameters())
-        params += [self.gate]
+        params = list(self.progressclassifier.parameters())
+        # params = list(self.token_type_emb.parameters())
+        # params += list(self.progress_emb.parameters())
+        # params += [self.gate]
         return params
         
     def forward(self, x, context=None, mask=None):
@@ -536,9 +622,8 @@ class CustomCrossAttentionMinimal(CustomCrossAttentionExt):
 
         if context is not None:     # cross-attention
             sim = self.cross_attention_control(sim, context, numheads=h)
-        
-        # attention
-        sim = (sim * self.scale).softmax(dim=-1)
+        else:
+            sim = (sim * self.scale).softmax(dim=-1)
 
         out = einsum('b i j, b j d -> b i d', sim, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
@@ -547,38 +632,52 @@ class CustomCrossAttentionMinimal(CustomCrossAttentionExt):
     def cross_attention_control(self, sim, context, numheads=None):
         #apply mask on sim
         max_neg_value = -torch.finfo(sim.dtype).max
-        # mask = context.captiontypes >= 0
-        # mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
-        # sim.masked_fill_(~mask, max_neg_value)
+        mask = context.captiontypes >= 2
+        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
         
-        # compute additional attention
-        typeemb = self.token_type_emb(context.captiontypes)
-        progressemb = self.progress_emb(context.progress[:, None, None])
-        
-        q_cas, k_cas = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=numheads), (progressemb, typeemb))
-        # force cast to fp32 to avoid overflowing
-        if _ATTN_PRECISION =="fp32":
-            with torch.autocast(enabled=False, device_type = 'cuda'):
-                q_cas, k_cas = q_cas.float(), k_cas.float()
-                sim_cas = einsum('b i d, b j d -> b i j', q_cas, k_cas)
-        else:
-            sim_cas = einsum('b i d, b j d -> b i j', q_cas, k_cas)
-        del q_cas, k_cas
-        # sim_cas.masked_fill_(~mask, max_neg_value)
-        
-        # add sim_cas to sim using gate
-        g = self.gate.repeat(sim.shape[0] // numheads)[:, None, None]
-        sim = sim + sim_cas * torch.tanh(g)
-        
-        """ Takes the unscaled unnormalized attention scores computed by cross-attention module, returns adapted attention scores. """
-        wf = self.weight_func(sim, context)
-        
+        # get mask that selects global as well as applicable local prompt
+        wf = self.weight_func(sim, context, sim_mask=mask)
+        wfscale = wf.max()
+
+        # expand dimensions to match heads
         wf = wf[:, None].repeat(1, numheads, 1, 1)
         wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
         
-        sim.masked_fill_(wf == 0, max_neg_value)
+        # remove the global part from the mask
+        wf.masked_fill_(~mask, 0)  # max_neg_value)
+        # determine where to use global mask (where no local descriptions are available)
+        useglobal = wf.sum(-1) == 0
+        
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        wfmaxes = wf.max(-1, keepdim=True)[0]
+        wf = (wf >= (wfmaxes.clamp_min(1e-3) - 1e-4))
+        
+        # get mask that selects only global tokens
+        gmask = (context.captiontypes >= 0) & (context.captiontypes < 2)
+        gmask = repeat(gmask, 'b j -> (b h) () j', h=numheads)
+        
+        # update stimulation to attend to global tokens when no local tokens are available
+        lmask = wf | (useglobal[:, :, None] & gmask)
+        
+        gsim = sim.masked_fill(gmask==0, max_neg_value)
+        gattn = (gsim * self.scale).softmax(dim=-1)
+        
+        lsim = sim.masked_fill(lmask==0, max_neg_value)
+        lattn = (lsim * self.scale).softmax(dim=-1)
+        
+        progressclasses = self.progressclassifier(context.progress).view(-1, 2)
+        attn = gattn.float() * progressclasses[:, 0][:, None, None] + lattn.float() * progressclasses[:, 1][:, None, None]
+        return attn
+        
+        
+        # cas_mask = gmask.float() * progressclasses[:, 0][:, None, None] + lmask.float() * progressclasses[:, 1][:, None, None]
+        # cas_mask = cas_mask * wfscale
+        # sim = sim + cas_mask
+        
+        # sim.masked_fill_((lmask | gmask) == 0, max_neg_value)
         # sim = sim + wf
-        return sim
+        # sim = (sim * self.scale).softmax(dim=-1)
+        # return sim
 
 
 class ControlPWWLDM(ControlLDM):
@@ -914,7 +1013,7 @@ class ControlPWWLDMSimpleEncode(ControlPWWLDM):
         return ret
     
     
-def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simpleencode=False):
+def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simpleencode=False, threshold=-1):
     model.__class__ = ControlPWWLDM
     if simpleencode:
         model.__class__ = ControlPWWLDMSimpleEncode
@@ -929,7 +1028,9 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
                      "global": CustomCrossAttentionBaselineGlobal,
                      "bothext": CustomCrossAttentionExt,
                      "bothminimal": CustomCrossAttentionMinimal,
-                     "doublecross": None}[cas_name]
+                     "doublecross": None,
+                     "sepswitch": CustomCrossAttentionSepSwitch,
+                     }[cas_name]
         
     if cas_class is None:
         cas_class = CustomCrossAttentionBaseline
@@ -945,6 +1046,8 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
                 DoublecrossBasicTransformerBlock.convert(module)
             else:
                 module.attn2 = cas_class.from_base(module.attn2)
+                module.attn2.threshold = threshold
+        
             
     for module in model.control_model.modules():
         if isinstance(module, BasicTransformerBlock): # module.__class__.__name__ == "BasicTransformerBlock":
@@ -953,6 +1056,7 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
                 DoublecrossBasicTransformerBlock.convert(module)
             else:
                 module.attn2 = cas_class.from_base(module.attn2)
+                module.attn2.threshold = threshold
     
     return model
 
@@ -978,7 +1082,7 @@ def get_checkpointing_callbacks(interval=6*60*60, dirpath=None):
 
 
 def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='control_v11p_sd15_seg', cas_name="bothext",
-                                freezedown=False, simpleencode=False):
+                                freezedown=False, simpleencode=False, threshold=-1):
     # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
     model = create_model(f'./models/{model_name}.yaml').cpu()
     # load main weights
@@ -988,7 +1092,7 @@ def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='co
     model.base_model_name = basemodelname
     model.controlnet_model_name = model_name
     
-    model = convert_model(model, cas_name=cas_name, freezedown=freezedown, simpleencode=simpleencode)
+    model = convert_model(model, cas_name=cas_name, freezedown=freezedown, simpleencode=simpleencode, threshold=threshold)
     return model
 
 
@@ -996,7 +1100,7 @@ def main(batsize=5,
          version="v2",
          datadir="/USERSPACE/lukovdg1/coco2017/",
          devexamples="coco2017.4dev.examples.pkl",
-         cas="bothminimal",  # "both", "local", "global", "bothext", "bothminimal", "doublecross"
+         cas="sepswitch",  # "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
          devices=(0,),
          numtrain=-1,
          forreal=False,
@@ -1005,9 +1109,12 @@ def main(batsize=5,
          freezedown=False,      # don't adapt the down-sampling blocks of the Unet, only change and train the upsamling blocks
          simpleencode=False,    # encode both global and all local prompts as one sequence
         #  minimal=False,         # only interaction between layer+head info, progress and token type (global/local/bos) (<-- essentially a learned schedule for CAS, independent of content)
-         generate=True,
+         generate="",
+         threshold=-1,
+         loadckpt="",
          ):  
     args = locals().copy()
+    # print(args)
     print(json.dumps(args, indent=4))     
     ### usage
     # simpleencode=True: only makes sense with both or bothext
@@ -1020,23 +1127,27 @@ def main(batsize=5,
     learning_rate = 1e-5
     sd_locked = False
     
+    generate_set = "dev" if generate.lower() == "true" else generate
+    generate = generate != ""
+    
     numtrain = None if numtrain == -1 else numtrain
     
     expnr = 1
     def get_exp_name(_expnr):
-            ret = f"checkpoints/{version}/checkpoints_coco_{cas}_{version}_exp_{_expnr}{'_forreal' if forreal else ''}"
-            if freezedown:
-                ret += "_freezedown"
-            if simpleencode:
-                ret += "_simpleencode"
-            return ret
+        ret = f"checkpoints/{version}/checkpoints_coco_{cas}_{version}_exp_{_expnr}{'_forreal' if forreal else ''}"
+        if freezedown:
+            ret += "_freezedown"
+        if simpleencode:
+            ret += "_simpleencode"
+        if cas in ("sepswitch",):
+            ret += f"_threshold={threshold}"
+        return ret
         
     exppath = Path(get_exp_name(expnr))
     while exppath.exists():
         expnr += 1
         exppath = Path(get_exp_name(expnr))
         
-    
     # load dev set from pickle
     with open(devexamples, "rb") as f:
         loadedexamples = pkl.load(f)
@@ -1044,7 +1155,7 @@ def main(batsize=5,
     valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas, simpleencode=simpleencode)
     valid_dl = COCODataLoader(valid_ds, batch_size=4, num_workers=4, shuffle=False)
     
-    model = create_controlnet_pww_model(cas_name=cas, freezedown=freezedown, simpleencode=simpleencode)
+    model = create_controlnet_pww_model(cas_name=cas, freezedown=freezedown, simpleencode=simpleencode, threshold=threshold)
     
     seedswitch = SeedSwitch(seed, log_image_seed)
     image_logger = ImageLogger(batch_frequency=logger_freq, dl=valid_dl, seed=seedswitch)
@@ -1076,6 +1187,9 @@ def main(batsize=5,
 
     # Train!
     print(f"Writing to {exppath}")
+    model.save_hyperparameters()
+    # with open(exppath / "args.json", "w") as f:
+    #     json.dump(args, f)
     trainer.fit(model, dl)
     
     # # generate
@@ -1125,5 +1239,12 @@ if __name__ == "__main__":
     # 401758, 228764, 460872, 524594            <--- cat and dog
     # 572448, 543192, 25411, 42641      <-- apples and oranges
     
+    # BASELINES
     # DONE: implement clean global cas here
+    # DONE: implement switching from local-only to global-only
+    # TODO: implement global-only prompt with annotation
+    
+    # TODO: implement loading already trained models
+    # TODO: port the rabbitfire and balls examples
+    # TODO: implement sampling on entire dev set
     
