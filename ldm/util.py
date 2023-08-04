@@ -7,6 +7,32 @@ import numpy as np
 from inspect import isfunction
 from PIL import Image, ImageDraw, ImageFont
 
+import random, os
+
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
+
+
+class SeedSwitch(object):
+    def __init__(self, trainseed, validseed) -> None:
+        self.trainseed, self.validseed = trainseed, validseed
+        seed_everything(self.trainseed)
+        
+    def __enter__(self):
+        self.intermediateseed = random.randint(0, 100000)
+        seed_everything(self.validseed)
+        
+    def __exit__(self, type, value, traceback):
+        seed_everything(self.intermediateseed)
+
+
 
 def log_txt_as_img(wh, xc, size=10):
     # wh a tuple of (width, height)

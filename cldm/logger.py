@@ -39,57 +39,40 @@ class ImageLogger(Callback):
         self.log_first_step = log_first_step
         self.dl = dl    # dataloader instead of training batch
         self.seed = seed
+        self.batch_size = self.dl.batch_size
 
     @rank_zero_only
     def log_local(self, save_dir, split, images, global_step, current_epoch, batch_idx):
         root = os.path.join(save_dir, "image_log", split)
         for k in images:
-            grid = torchvision.utils.make_grid(images[k], nrow=4)
+            grid = torchvision.utils.make_grid(images[k], nrow=self.batch_size)
             if self.rescale:
                 grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
             grid = grid.transpose(0, 1).transpose(1, 2).squeeze(-1)
             grid = grid.numpy()
             grid = (grid * 255).astype(np.uint8)
-            filename = "{}_gs-{:06}_e-{:06}_b-{:06}.png".format(k, global_step, current_epoch, batch_idx)
+            filename = "{}_gs-{:06}_e-{:03}_b-{:06}.png".format(k, global_step, current_epoch, batch_idx)
             path = os.path.join(root, filename)
             os.makedirs(os.path.split(path)[0], exist_ok=True)
             Image.fromarray(grid).save(path)
-
-    def log_img(self, pl_module, batch, batch_idx, split="train"):
-        if isinstance(self.seed, SeedSwitch):
-            self.seed.__enter__()
-        else:
-            seed_everything(self.seed)
-        check_idx = batch_idx  # if self.log_on_batch_idx else pl_module.global_step
-        if (self.check_frequency(check_idx) and  # batch_idx % self.batch_freq == 0
-                hasattr(pl_module, "log_images") and
-                callable(pl_module.log_images) and
-                self.max_images > 0):
-            logger = type(pl_module.logger)
-
-            is_train = pl_module.training
-            if is_train:
-                pl_module.eval()
-                
-            device = pl_module.device
-            N = None
-            prevbatch = None
-            for batch in iter(self.dl):
-                bs = batch["image"].shape[0] 
-                if N is None:
-                    N = bs
-                if bs < N:
-                    break
-                prevbatch = batch
-            # batch = next(iter(self.dl))
-            batch = prevbatch
+            
+    def do_log_img(self, pl_module, split="train"):
+        is_train = pl_module.training
+        if is_train:
+            pl_module.eval()
+            
+        device = pl_module.device
+        numgenerated = 0
+        
+        for batch_idx, batch in enumerate(iter(self.dl)):
             batch = nested_to(batch, device)
 
             with torch.no_grad():
                 images = pl_module.log_images(batch, split=split, **self.log_images_kwargs)
 
             for k in images:
-                N = min(images[k].shape[0], self.max_images)
+                N = images[k].shape[0]
+                numgenerated += N
                 images[k] = images[k][:N]
                 if isinstance(images[k], torch.Tensor):
                     images[k] = images[k].detach().cpu()
@@ -97,10 +80,27 @@ class ImageLogger(Callback):
                         images[k] = torch.clamp(images[k], -1., 1.)
 
             self.log_local(pl_module.logger.save_dir, split, images,
-                           pl_module.global_step, pl_module.current_epoch, batch_idx)
+                        pl_module.global_step, pl_module.current_epoch, batch_idx)
+            
+            if numgenerated >= self.max_images:
+                break
 
-            if is_train:
-                pl_module.train()
+        if is_train:
+            pl_module.train()
+
+    def log_img(self, pl_module, global_step, split="train"):
+        if isinstance(self.seed, SeedSwitch):
+            self.seed.__enter__()
+        else:
+            seed_everything(self.seed)
+        # if self.log_on_batch_idx else pl_module.global_step
+        if (self.check_frequency(global_step) and  # batch_idx % self.batch_freq == 0
+                hasattr(pl_module, "log_images") and
+                callable(pl_module.log_images) and
+                self.max_images > 0):
+            # logger = type(pl_module.logger)
+            self.do_log_img(pl_module=pl_module, split=split)
+            
         if isinstance(self.seed, SeedSwitch):
             self.seed.__exit__(None, None, None)
 
@@ -115,4 +115,4 @@ class ImageLogger(Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
         if not self.disabled:
             # self.log_img(pl_module, batch, batch_idx, split="train")
-            self.log_img(pl_module, batch, trainer.global_step, split="train")      # Fixed logging to actually log every N steps
+            self.log_img(pl_module, trainer.global_step, split="train")      # Fixed logging to actually log every N steps

@@ -1358,6 +1358,8 @@ if __name__ == "__main__":
     # MAYBE:
     # TODO: verify ediffi does not include BOS token
     
+    # TODO: try applying CAS to subset of Unet layers only (only mid and upsample)
+    
     
     # IDEA: fine-tune cross-attention of main stable diffusion:
     #       - use the "both" setting and add extra embeddings that indicate whether token is from local prompt or global prompt, and maybe also whether it is relevant to the region or not (if we do the both variant that exposes the entire global prompt)

@@ -45,7 +45,7 @@ class MyDataset(Dataset):
 def main(x=0):
     # Configs
     batch_size = 4
-    logger_freq = 3
+    logger_freq = 1
     learning_rate = 1e-5
     sd_locked = True
     only_mid_control = False

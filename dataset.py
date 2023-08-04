@@ -1006,6 +1006,7 @@ class COCODataLoader(object):
         super().__init__()
         self.ds = cocodataset
         self.dataloaders = []
+        self.batch_size = min(batch_size.values()) if isinstance(batch_size, dict) else batch_size
         for k, cocosubset in self.ds.examples:
             if isinstance(batch_size, dict):
                 batsize = batch_size[k]

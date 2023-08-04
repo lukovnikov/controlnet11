@@ -1082,7 +1082,7 @@ def get_checkpointing_callbacks(interval=6*60*60, dirpath=None):
 
 
 def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='control_v11p_sd15_seg', cas_name="bothext",
-                                freezedown=False, simpleencode=False, threshold=-1):
+                                freezedown=False, simpleencode=False, threshold=-1, loadckpt=""):
     # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
     model = create_model(f'./models/{model_name}.yaml').cpu()
     # load main weights
@@ -1093,14 +1093,24 @@ def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='co
     model.controlnet_model_name = model_name
     
     model = convert_model(model, cas_name=cas_name, freezedown=freezedown, simpleencode=simpleencode, threshold=threshold)
+    
+    if loadckpt != "":
+        refparam1a = model.model.diffusion_model.middle_block[1].proj_in.weight.data.clone()
+        refparam2a = deepcopy(model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2l.to_q.weight.data.clone())
+        ckpt_state_dict = load_state_dict(loadckpt, location="cpu")
+        # testing the partial loading
+        model.load_state_dict(ckpt_state_dict, strict=False)
+        refparam1b = model.model.diffusion_model.middle_block[1].proj_in.weight.data.clone()
+        refparam2b = deepcopy(model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2l.to_q.weight.data.clone())
+        assert torch.all(refparam1a == refparam1b)
     return model
 
 
 def main(batsize=5,
-         version="v2",
+         version="v3",
          datadir="/USERSPACE/lukovdg1/coco2017/",
          devexamples="coco2017.4dev.examples.pkl",
-         cas="sepswitch",  # "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
+         cas="doublecross",  # "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
          devices=(0,),
          numtrain=-1,
          forreal=False,
@@ -1109,9 +1119,9 @@ def main(batsize=5,
          freezedown=False,      # don't adapt the down-sampling blocks of the Unet, only change and train the upsamling blocks
          simpleencode=False,    # encode both global and all local prompts as one sequence
         #  minimal=False,         # only interaction between layer+head info, progress and token type (global/local/bos) (<-- essentially a learned schedule for CAS, independent of content)
-         generate="",
+         generate="dev",   # ""
          threshold=-1,
-         loadckpt="",
+         loadckpt="", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
          ):  
     args = locals().copy()
     # print(args)
@@ -1155,48 +1165,54 @@ def main(batsize=5,
     valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas, simpleencode=simpleencode)
     valid_dl = COCODataLoader(valid_ds, batch_size=4, num_workers=4, shuffle=False)
     
-    model = create_controlnet_pww_model(cas_name=cas, freezedown=freezedown, simpleencode=simpleencode, threshold=threshold)
+    model = create_controlnet_pww_model(cas_name=cas, freezedown=freezedown, simpleencode=simpleencode, 
+                                        threshold=threshold, loadckpt=loadckpt)
     
     seedswitch = SeedSwitch(seed, log_image_seed)
     image_logger = ImageLogger(batch_frequency=logger_freq, dl=valid_dl, seed=seedswitch)
-        
-    ds = COCOPanopticDataset(maindir=datadir, split="train" if forreal else "valid", casmode=cas, simpleencode=simpleencode, 
-                    max_samples=numtrain if numtrain is not None else (None if forreal else 1000))
     
-    print(len(ds))
-    batsizes = {384: round(batch_size * 2.4), 448:round(batch_size * 1.4), 512: batch_size}
-    print(f"Batch sizes: {batsizes}")
-    dl = COCODataLoader(ds, batch_size=batsizes, 
-                        num_workers=max(batsizes.values()),
-                        shuffle=True)
-
-    model.learning_rate = learning_rate if not generate else 0
-    model.sd_locked = sd_locked
-        
-    checkpoints = get_checkpointing_callbacks(interval=8*60*60 if forreal else 60*10, dirpath=exppath)
-    logger = pl.loggers.TensorBoardLogger(save_dir=exppath)
-    
-    max_steps = -1
     if generate:
-        max_steps = 1
+        exppath.mkdir(parents=True, exist_ok=False)
+        image_logger.do_log_img(model, split="gen")
     
-    trainer = pl.Trainer(accelerator="gpu", devices=devices, 
-                        precision=32, max_steps=max_steps,
-                        logger=logger,
-                        callbacks=checkpoints + [image_logger])
+    else:
+        ds = COCOPanopticDataset(maindir=datadir, split="train" if forreal else "valid", casmode=cas, simpleencode=simpleencode, 
+                        max_samples=numtrain if numtrain is not None else (None if forreal else 1000))
+        
+        print(len(ds))
+        batsizes = {384: round(batch_size * 2.4), 448:round(batch_size * 1.4), 512: batch_size}
+        print(f"Batch sizes: {batsizes}")
+        dl = COCODataLoader(ds, batch_size=batsizes, 
+                            num_workers=max(batsizes.values()),
+                            shuffle=True)
 
-    # Train!
-    print(f"Writing to {exppath}")
-    model.save_hyperparameters()
-    # with open(exppath / "args.json", "w") as f:
-    #     json.dump(args, f)
-    trainer.fit(model, dl)
-    
-    # # generate
-    # device = torch.device("cuda", devices[0])
-    # print("device", device)
-    # model = model.to(device)
-    # image_logger.log_img(model, None, 0, split="dev")
+        model.learning_rate = learning_rate if not generate else 0
+        model.sd_locked = sd_locked
+            
+        checkpoints = get_checkpointing_callbacks(interval=8*60*60 if forreal else 60*10, dirpath=exppath)
+        logger = pl.loggers.TensorBoardLogger(save_dir=exppath)
+        
+        max_steps = -1
+        if generate:
+            max_steps = 1
+        
+        trainer = pl.Trainer(accelerator="gpu", devices=devices, 
+                            precision=32, max_steps=max_steps,
+                            logger=logger,
+                            callbacks=checkpoints + [image_logger])
+
+        # Train!
+        print(f"Writing to {exppath}")
+        
+        # with open(exppath / "args.json", "w") as f:
+        #     json.dump(args, f)
+        trainer.fit(model, dl)
+        
+        # # generate
+        # device = torch.device("cuda", devices[0])
+        # print("device", device)
+        # model = model.to(device)
+        # image_logger.log_img(model, None, 0, split="dev")
     
     
 if __name__ == "__main__":
