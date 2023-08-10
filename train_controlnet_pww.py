@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 from typing import Any, Dict
 import cv2
+import einops
 import fire
 import numpy as np
 import torch
@@ -19,13 +20,15 @@ from torchvision.utils import make_grid
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from cldm.cldm import ControlLDM
-from cldm.logger import ImageLogger
+from cldm.logger import ImageLogger, nested_to
 from cldm.model import create_model, load_state_dict
 from dataset import COCOPanopticDataset, COCODataLoader
 from ldm.modules.attention import BasicTransformerBlock, default
 from ldm.modules.diffusionmodules.util import torch_cat_nested
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
-from ldm.util import SeedSwitch, log_txt_as_img
+from ldm.util import SeedSwitch, log_txt_as_img, seed_everything
+
+from gradio_pww import _tokenize_annotated_prompt, create_tools, CustomTextConditioning as CTC_gradio_pww
 
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
@@ -185,6 +188,23 @@ class CustomCrossAttentionBaseline(CustomCrossAttentionBase):
         return params
     
 
+class CustomCrossAttentionDelegated(CustomCrossAttentionBaseline):      # delegated cross attention manipulation to the context object
+    def cross_attention_control(self, sim, context, numheads=None):
+        ret = context.cross_attention_control(sim)
+        # TODO: below is for debugging
+        #apply mask on sim
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = (context.captiontypes >= 0) & (context.captiontypes < 2)
+        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
+        ret2 = deepcopy(sim.clone())
+        ret2.masked_fill_(~mask, max_neg_value)
+        
+        if not torch.allclose(ret, ret2):
+            print("not same")
+        
+        return ret
+    
+
 class CustomCrossAttentionBaselineBoth(CustomCrossAttentionBaseline):
     
     def cross_attention_control(self, sim, context, numheads=None):
@@ -264,7 +284,7 @@ class CustomCrossAttentionSepSwitch(CustomCrossAttentionBaseline):
     def cross_attention_control(self, sim, context, numheads=None):
         # compute mask that ignores everything except the local descriptions
         max_neg_value = -torch.finfo(sim.dtype).max
-        mask = context.captiontypes >= 2
+        mask = context.captiontypes >= 2                # localmask
         mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
         
         # get mask that selects global as well as applicable local prompt
@@ -313,6 +333,8 @@ class CustomCrossAttentionBaselineGlobal(CustomCrossAttentionBaseline):
     
     
 class DoublecrossBasicTransformerBlock(BasicTransformerBlock):
+    threshold = 0.2 
+    
     @classmethod
     def convert(cls, m):
         m.__class__ = cls
@@ -334,7 +356,12 @@ class DoublecrossBasicTransformerBlock(BasicTransformerBlock):
         
     def _forward(self, x, context=None):
         x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x
-        x = self.manual_gate * torch.tanh(self.learned_gate) * self.attn2l(self.norm2l(x), context=context) + x
+        if self.training:
+            x = self.manual_gate * torch.tanh(self.learned_gate) * self.attn2l(self.norm2l(x), context=context) + x
+        else:
+            threshold_gate = (context["c_crossattn"][0].progress < self.threshold).float()
+            if torch.any(threshold_gate):
+                x = threshold_gate[:, None, None] * self.manual_gate * torch.tanh(self.learned_gate) * self.attn2l(self.norm2l(x), context=context) + x
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
         return x
@@ -481,6 +508,36 @@ class CustomCrossAttentionExt(CustomCrossAttentionBase):
     def cross_attention_control(self, sim, context, numheads=None):
         #apply mask on sim
         max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.captiontypes >= 2
+        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
+        
+        # get mask that selects global as well as applicable local prompt
+        wf = self.weight_func(sim, context, sim_mask=mask)
+
+        # expand dimensions to match heads
+        wf = wf[:, None].repeat(1, numheads, 1, 1)
+        wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
+        
+        # remove the global part from the mask
+        wf.masked_fill_(~mask, 0)  # max_neg_value)
+        
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        wfmaxes = wf.max(-1, keepdim=True)[0]
+        wf = (wf >= (wfmaxes.clamp_min(1e-3) - 1e-4))
+        
+        # get mask that selects only global tokens
+        gmask = (context.captiontypes >= 0) & (context.captiontypes < 2)
+        gmask = repeat(gmask, 'b j -> (b h) () j', h=numheads)
+        
+        # update stimulation to attend to global tokens when no local tokens are available
+        lmask = wf | gmask
+        
+        sim.masked_fill_(~lmask, max_neg_value)
+        return sim
+        
+        
+        #apply mask on sim
+        max_neg_value = -torch.finfo(sim.dtype).max
         mask = context.captiontypes >= 0
         mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
         sim.masked_fill_(~mask, max_neg_value)
@@ -545,7 +602,7 @@ class DiscretizedProgressEmbed(torch.nn.Module):
     
     
 class ProgressClassifier(torch.nn.Module):      # classifies whether to use global prompt or local prompt for every head given progress
-    INITBIAS = -3
+    INITBIAS = 0
     def __init__(self, embdim=512, numheads=8) -> None:
         super().__init__()
         self.embdim, self.numheads, self.numclasses = embdim, numheads, 2
@@ -689,6 +746,16 @@ class ControlPWWLDM(ControlLDM):
     # def get_input(self, batch, k, bs=None, *args, **kwargs):
     #     # takes a batch and outputs image x and conditioning info c  --> keep unchanged
     
+    def encode_using_text_encoder(self, input_ids):
+        outputs = self.cond_stage_model.transformer(input_ids=input_ids, output_hidden_states=self.cond_stage_model.layer=="hidden")
+        if self.cond_stage_model.layer == "last":
+            text_emb = outputs.last_hidden_state
+        elif self.cond_stage_model.layer == "pooled":
+            text_emb = outputs.pooler_output[:, None, :]
+        else:
+            text_emb = outputs.hidden_states[self.layer_idx]
+        return text_emb
+    
     def get_learned_conditioning(self, cond):
         # takes conditioning info (cond_key) and preprocesses it to later be fed into LDM
         # returns CustomTextConditioning object
@@ -720,12 +787,13 @@ class ControlPWWLDM(ControlLDM):
             device = cond["caption"].device
             tokenids = cond["caption"].cpu()
             layerids = cond["layerids"].cpu()
+            encoder_layerids = cond["encoder_layerids"].cpu()
             input_ids = []
             for i in range(len(tokenids)):
                 start_j = 0
                 for j in range(len(tokenids[0])):
-                    layerid = layerids[i, j].item()
-                    next_layerid = layerids[i, j+1].item() if j+1 < len(tokenids[0]) else -1
+                    layerid = encoder_layerids[i, j].item()
+                    next_layerid = encoder_layerids[i, j+1].item() if j+1 < len(tokenids[0]) else -1
                     if next_layerid == -1:
                         break
                     else:     # not padded
@@ -737,14 +805,8 @@ class ControlPWWLDM(ControlLDM):
             input_ids = pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id).to(device)
              
             # 2. encode using text encoder
-            outputs = self.cond_stage_model.transformer(input_ids=input_ids, output_hidden_states=self.cond_stage_model.layer=="hidden")
-            if self.cond_stage_model.layer == "last":
-                text_emb = outputs.last_hidden_state
-            elif self.cond_stage_model.layer == "pooled":
-                text_emb = outputs.pooler_output[:, None, :]
-            else:
-                text_emb = outputs.hidden_states[self.layer_idx]
-                
+            text_emb = self.encode_using_text_encoder(input_ids)
+            
             # 3. pack text embs back to original format, ensure compatibility with masks
             out_emb = torch.zeros(tokenids.shape[0], tokenids.shape[1], text_emb.shape[2], dtype=text_emb.dtype, device=text_emb.device)
             tokenids_recon = pad_token_id * torch.ones_like(tokenids)
@@ -752,8 +814,8 @@ class ControlPWWLDM(ControlLDM):
             for i in range(len(tokenids)):
                 start_j = 0
                 for j in range(len(tokenids[0])):
-                    layerid = layerids[i, j].item()
-                    next_layerid = layerids[i, j+1].item() if j+1 < len(tokenids[0]) else -1
+                    layerid = encoder_layerids[i, j].item()
+                    next_layerid = encoder_layerids[i, j+1].item() if j+1 < len(tokenids[0]) else -1
                     if next_layerid == -1:
                         break
                     else:     # not padded
@@ -854,51 +916,67 @@ class ControlPWWLDM(ControlLDM):
     def get_uncond_batch(self, batch):      # DONE: change regionmasks to fit new prompts
         uncond_cond = deepcopy(batch)       # DONE: change all prompts to "" and re-tokenize
         bos, eos = self.cond_stage_model.tokenizer.bos_token_id, self.cond_stage_model.tokenizer.pad_token_id
+        maxlen = self.cond_stage_model.tokenizer.model_max_length
+        bs = batch["caption"].shape[0]
+        device = batch["caption"].device
         
-        # new_caption = [[] for _ in range(batch["caption"].shape[0])]
-        # new_layerids = [[] for _ in new_caption]
-        # new_captiontypes = [[] for _ in new_caption]
+        new_caption3 = torch.ones(bs, maxlen, device=device, dtype=torch.long) * eos
+        new_layerids3 = torch.zeros_like(new_caption3)
+        new_captiontypes3 = torch.zeros_like(new_caption3) + 1
+        new_caption3[:, 0] = bos
+        new_caption3 = torch.cat([new_caption3, new_caption3], 1)
+        new_layerids3 = torch.cat([new_layerids3, new_layerids3 + 1], 1)
+        new_captiontypes3 = torch.cat([new_captiontypes3, new_captiontypes3 + 1], 1)
+        new_captiontypes3[:, 0] = 0
         
-        new_caption2 = torch.ones_like(batch["caption"]) * eos
-        new_layerids2 = torch.ones_like(batch["layerids"]) * -1
-        new_captiontypes2 = torch.ones_like(batch["captiontypes"]) * -1
+        new_regionmasks3 = {k: torch.ones(bs, new_caption3.shape[1], v.shape[2], v.shape[3], device=v.device, dtype=v.dtype) 
+                            for k, v in batch["regionmasks"].items()}
         
-        new_regionmasks = {k: torch.zeros_like(v) for k, v in batch["regionmasks"].items()}
-        # device = batch["caption"].device
-        caption = batch["caption"].cpu()
+        # # new_caption = [[] for _ in range(batch["caption"].shape[0])]
+        # # new_layerids = [[] for _ in new_caption]
+        # # new_captiontypes = [[] for _ in new_caption]
         
-        # layerids = batch["layerids"].cpu()
-        # captiontypes = batch["captiontypes"].cpu()
+        # new_caption2 = torch.ones_like(batch["caption"]) * eos
+        # new_layerids2 = torch.ones_like(batch["layerids"]) * 1
+        # new_captiontypes2 = torch.ones_like(batch["captiontypes"]) * 2
         
-        prev = None
-        for i in range(len(caption)):
-            k = 0
-            for j in range(len(caption[0])):
-                cur = caption[i, j].item()
-                if cur == bos or (cur == eos and prev != eos):
-                    # new_caption[i].append(cur)
-                    # new_layerids[i].append(layerids[i, j].item())
-                    # new_captiontypes[i].append(captiontypes[i, j].item())
-                    new_caption2[i, k] = batch["caption"][i, j]
-                    new_layerids2[i, k] = batch["layerids"][i, j]
-                    new_captiontypes2[i, k] = batch["captiontypes"][i, j]
-                    for res in new_regionmasks:
-                        new_regionmasks[res][i, k] = batch["regionmasks"][res][i, j]
-                    k += 1
-                prev = cur
+        # new_regionmasks = {k: torch.zeros_like(v) for k, v in batch["regionmasks"].items()}
+        # # device = batch["caption"].device
+        # caption = batch["caption"].cpu()
+        
+        # # layerids = batch["layerids"].cpu()
+        # # captiontypes = batch["captiontypes"].cpu()
+        
+        # prev = None
+        # for i in range(len(caption)):
+        #     k = 0
+        #     for j in range(len(caption[0])):
+        #         cur = caption[i, j].item()
+        #         if cur == bos or (cur == eos and prev != eos):
+        #             # new_caption[i].append(cur)
+        #             # new_layerids[i].append(layerids[i, j].item())
+        #             # new_captiontypes[i].append(captiontypes[i, j].item())
+        #             new_caption2[i, k] = batch["caption"][i, j]
+        #             new_layerids2[i, k] = batch["layerids"][i, j]
+        #             new_captiontypes2[i, k] = batch["captiontypes"][i, j]
+        #             for res in new_regionmasks:
+        #                 new_regionmasks[res][i, k] = batch["regionmasks"][res][i, j]
+        #             k += 1
+        #         prev = cur
                 
-        # maxlen = caption.shape[1]
-        # for i in range(len(new_caption)):
-        #     while len(new_caption[i]) < maxlen:
-        #     # for j in range(len(new_caption[i]), maxlen):
-        #         new_caption[i].append(eos)
-        #         new_layerids[i].append(-1)
-        #         new_captiontypes[i].append(-1)
+        # # maxlen = caption.shape[1]
+        # # for i in range(len(new_caption)):
+        # #     while len(new_caption[i]) < maxlen:
+        # #     # for j in range(len(new_caption[i]), maxlen):
+        # #         new_caption[i].append(eos)
+        # #         new_layerids[i].append(-1)
+        # #         new_captiontypes[i].append(-1)
                 
-        uncond_cond["caption"] = new_caption2  #torch.tensor(new_caption).to(device)
-        uncond_cond["layerids"] = new_layerids2  #torch.tensor(new_layerids).to(device)
-        uncond_cond["captiontypes"] = new_captiontypes2  #torch.tensor(new_captiontypes).to(device)
-        uncond_cond["regionmasks"] = new_regionmasks
+        uncond_cond["caption"] = new_caption3  #torch.tensor(new_caption).to(device)
+        uncond_cond["layerids"] = new_layerids3  #torch.tensor(new_layerids).to(device)
+        uncond_cond["encoder_layerids"] = new_layerids3.clone()  #torch.tensor(new_layerids).to(device)
+        uncond_cond["captiontypes"] = new_captiontypes3  #torch.tensor(new_captiontypes).to(device)
+        uncond_cond["regionmasks"] = new_regionmasks3
                 
         return uncond_cond
     
@@ -953,12 +1031,11 @@ class ControlPWWLDM(ControlLDM):
             uncond_batch = self.get_uncond_batch(batch)
             _, uc = self.get_input(uncond_batch, self.first_stage_key, bs=N)
             uc_cat, uc_cross = uc["c_concat"][0], uc["c_crossattn"][0]
-            uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
             samples_cfg, _ = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
                                              batch_size=N, ddim=use_ddim,
                                              ddim_steps=ddim_steps, eta=ddim_eta,
                                              unconditional_guidance_scale=unconditional_guidance_scale,
-                                             unconditional_conditioning=uc_full,
+                                             unconditional_conditioning={"c_concat": [uc_cat], "c_crossattn": [uc_cross]},
                                              )
             x_samples_cfg = self.decode_first_stage(samples_cfg)
             log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = generated_img = x_samples_cfg
@@ -1030,6 +1107,7 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
                      "bothminimal": CustomCrossAttentionMinimal,
                      "doublecross": None,
                      "sepswitch": CustomCrossAttentionSepSwitch,
+                     "delegated": CustomCrossAttentionDelegated,
                      }[cas_name]
         
     if cas_class is None:
@@ -1044,6 +1122,7 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
             assert not module.disable_self_attn
             if cas_name == "doublecross":
                 DoublecrossBasicTransformerBlock.convert(module)
+                module.threshold = threshold
             else:
                 module.attn2 = cas_class.from_base(module.attn2)
                 module.attn2.threshold = threshold
@@ -1054,6 +1133,7 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
             assert not module.disable_self_attn
             if cas_name == "doublecross":
                 DoublecrossBasicTransformerBlock.convert(module)
+                module.threshold = threshold
             else:
                 module.attn2 = cas_class.from_base(module.attn2)
                 module.attn2.threshold = threshold
@@ -1095,33 +1175,117 @@ def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='co
     model = convert_model(model, cas_name=cas_name, freezedown=freezedown, simpleencode=simpleencode, threshold=threshold)
     
     if loadckpt != "":
-        refparam1a = model.model.diffusion_model.middle_block[1].proj_in.weight.data.clone()
-        refparam2a = deepcopy(model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2l.to_q.weight.data.clone())
+        print(f"loading trained parameters from {loadckpt}")
+        # refparam1a = model.model.diffusion_model.middle_block[1].proj_in.weight.data.clone()
+        # refparam2a = deepcopy(model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2l.to_q.weight.data.clone())
         ckpt_state_dict = load_state_dict(loadckpt, location="cpu")
         # testing the partial loading
         model.load_state_dict(ckpt_state_dict, strict=False)
-        refparam1b = model.model.diffusion_model.middle_block[1].proj_in.weight.data.clone()
-        refparam2b = deepcopy(model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2l.to_q.weight.data.clone())
-        assert torch.all(refparam1a == refparam1b)
+        # refparam1b = model.model.diffusion_model.middle_block[1].proj_in.weight.data.clone()
+        # refparam2b = deepcopy(model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2l.to_q.weight.data.clone())
+        # assert torch.all(refparam1a == refparam1b)
     return model
 
 
+def _debug_compare():
+    # TODO: this is for debugging
+    batch = nested_to(next(iter(valid_dl)), device)
+    unbatch = model.get_uncond_batch(batch)
+    
+    # running regular one:
+    _, c = model.get_input(batch, model.first_stage_key, bs=1)
+    _, uc = model.get_input(unbatch, model.first_stage_key, bs=1)
+    control = c["c_concat"][0]
+    c_cross = c["c_crossattn"][0]
+    uc_cross = uc["c_crossattn"][0]
+    # samples_cfg, _ = model.sample_log(cond=cond,
+    #                                     batch_size=1, ddim=True,
+    #                                     ddim_steps=40, eta=1.0,
+    #                                     unconditional_guidance_scale=9.,
+    #                                     unconditional_conditioning=uncond,
+    #                                     )
+    model2, sampler = create_tools()
+    
+    
+    
+    model2.eval()
+    model2.to(device)
+    
+    # control = batch["cond_image"].permute(0, 3, 1, 2)
+    # xcond = CTC_gradio_pww(model.encode_using_text_encoder(batch["caption"]), batch["layerids"], batch["caption"], batch["captiontypes"] < 2, batch["captiontypes"] == 0)
+    xcond = CTC_gradio_pww(c_cross.embs, 
+                        layer_ids=c_cross.layer_ids, 
+                        token_ids=c_cross.token_ids, 
+                        global_prompt_mask=c_cross.global_prompt_mask, 
+                        global_bos_eos_mask=c_cross.global_bos_eos_mask)
+    xcond.cross_attn_masks = {k[0] * k[1]: v.view(v.shape[0], v.shape[1], -1).transpose(1, 2) for k, v in batch["regionmasks"].items()}
+    xcond.strength = 0
+    xcond.threshold = 0.5
+    xcond.softness = 0.
+    xcond.set_method("PosAttn")
+    cond = {"c_concat": [control], 
+            "c_crossattn": xcond}
+    
+    # xuncond = CTC_gradio_pww(model.encode_using_text_encoder(unbatch["caption"]), unbatch["layerids"], unbatch["caption"], unbatch["captiontypes"] < 2, unbatch["captiontypes"] == 0)
+    xuncond = CTC_gradio_pww(uc_cross.embs, 
+                        layer_ids=uc_cross.layer_ids, 
+                        token_ids=uc_cross.token_ids, 
+                        global_prompt_mask=uc_cross.global_prompt_mask, 
+                        global_bos_eos_mask=uc_cross.global_bos_eos_mask)
+    xuncond.cross_attn_masks = {k[0] * k[1]: v.view(v.shape[0], v.shape[1], -1).transpose(1, 2) for k, v in unbatch["regionmasks"].items()}
+    xuncond.strength = 0
+    xuncond.threshold = 0.5
+    xuncond.softness = 0.
+    xuncond.set_method("PosAttn")
+    uncond = {"c_concat": [control], 
+            "c_crossattn": xuncond}
+    seed_everything(seed=seed)
+    samples, intermediates = sampler.sample(40, 1,
+                                                (4, 64, 64), cond, verbose=False, eta=1.,
+                                                unconditional_guidance_scale=9.,
+                                                unconditional_conditioning=uncond)
+    
+    x_samples = model.decode_first_stage(samples)
+    
+    
+    
+    convert_model(model2, cas_name="delegated")
+    # sampler.model = model
+    seed_everything(seed=seed)
+    
+    # cond = {"c_concat": [control], "c_crossattn": [c_cross]}
+    # uncond = {"c_concat": [control], "c_crossattn": [uc_cross]}
+    xcond.captiontypes = c_cross.captiontypes
+    xuncond.captiontypes = uc_cross.captiontypes
+    cond = {"c_concat": [control], "c_crossattn": [xcond]}
+    uncond = {"c_concat": [control], "c_crossattn": [xuncond]}
+    
+    samples_cfg2, _ = sampler.sample(40, 1,
+                                                (4, 64, 64), cond, verbose=False, eta=1.,
+                                                unconditional_guidance_scale=9.,
+                                                unconditional_conditioning=uncond)
+    # x_samples_cfg = model.decode_first_stage(samples_cfg)
+    x_samples_cfg2 = model.decode_first_stage(samples_cfg2)
+    # END DEBUG
+
+
 def main(batsize=5,
-         version="v3",
+         version="v4",
          datadir="/USERSPACE/lukovdg1/coco2017/",
-         devexamples="coco2017.4dev.examples.pkl",
-         cas="doublecross",  # "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
+         devexamples="coco2017.4dev.examples.pkl,extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
+         cas="bothext",  # "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
          devices=(0,),
          numtrain=-1,
          forreal=False,
-         seed=12345,        # seed for training
+         seed=42,        # seed for training
          log_image_seed=41,     # seed for generating logging images
          freezedown=False,      # don't adapt the down-sampling blocks of the Unet, only change and train the upsamling blocks
+         freezecontrol=False,
          simpleencode=False,    # encode both global and all local prompts as one sequence
-        #  minimal=False,         # only interaction between layer+head info, progress and token type (global/local/bos) (<-- essentially a learned schedule for CAS, independent of content)
-         generate="dev",   # ""
-         threshold=-1,
-         loadckpt="", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
+         generate="alldev",   # ""
+         threshold=1.,
+        #  loadckpt="", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
+         loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/latest_all_epoch=epoch=9_step=step=100710.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
          ):  
     args = locals().copy()
     # print(args)
@@ -1137,7 +1301,7 @@ def main(batsize=5,
     learning_rate = 1e-5
     sd_locked = False
     
-    generate_set = "dev" if generate.lower() == "true" else generate
+    generate_set = "dev" if generate == "" else generate
     generate = generate != ""
     
     numtrain = None if numtrain == -1 else numtrain
@@ -1159,11 +1323,14 @@ def main(batsize=5,
         exppath = Path(get_exp_name(expnr))
         
     # load dev set from pickle
-    with open(devexamples, "rb") as f:
-        loadedexamples = pkl.load(f)
+    loadedexamples = []
+    for devexamplepath in devexamples.split(","):
+        with open(devexamplepath, "rb") as f:
+            loadedexamples_e = pkl.load(f)
+            loadedexamples += loadedexamples_e
     # override pickled defaults
     valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas, simpleencode=simpleencode)
-    valid_dl = COCODataLoader(valid_ds, batch_size=4, num_workers=4, shuffle=False)
+    valid_dl = COCODataLoader(valid_ds, batch_size=4, num_workers=4 if forreal else 0, shuffle=False)
     
     model = create_controlnet_pww_model(cas_name=cas, freezedown=freezedown, simpleencode=simpleencode, 
                                         threshold=threshold, loadckpt=loadckpt)
@@ -1172,8 +1339,13 @@ def main(batsize=5,
     image_logger = ImageLogger(batch_frequency=logger_freq, dl=valid_dl, seed=seedswitch)
     
     if generate:
+        device = torch.device("cuda", devices[0])
+        print("generation device", device)
+        model = model.to(device)
+            
         exppath.mkdir(parents=True, exist_ok=False)
-        image_logger.do_log_img(model, split="gen")
+        image_logger.do_log_img(model, exppath / "image_log", split="gen")
+        
     
     else:
         ds = COCOPanopticDataset(maindir=datadir, split="train" if forreal else "valid", casmode=cas, simpleencode=simpleencode, 
@@ -1183,7 +1355,7 @@ def main(batsize=5,
         batsizes = {384: round(batch_size * 2.4), 448:round(batch_size * 1.4), 512: batch_size}
         print(f"Batch sizes: {batsizes}")
         dl = COCODataLoader(ds, batch_size=batsizes, 
-                            num_workers=max(batsizes.values()),
+                            num_workers=max(batsizes.values()) if forreal else 0,
                             shuffle=True)
 
         model.learning_rate = learning_rate if not generate else 0
@@ -1239,7 +1411,7 @@ if __name__ == "__main__":
     
     # TODO: train CAS better by dropping out the ControlNet control (because ControlNet already implies some object identity with its shapes)
     
-    # TODO: IDEA: double-cross-attention: one cross attention on global prompt (unchanged, untrained?), and another cross-attention on local prompts
+    # DONE: IDEA: double-cross-attention: one cross attention on global prompt (unchanged, untrained?), and another cross-attention on local prompts
     
     # DONE: validation setup: take images of apples and oranges and of cats and dogs and change where the cats and dogs and apples and oranges are
     # DONE: use panoptic segmentation data from COCO instead
@@ -1258,9 +1430,11 @@ if __name__ == "__main__":
     # BASELINES
     # DONE: implement clean global cas here
     # DONE: implement switching from local-only to global-only
-    # TODO: implement global-only prompt with annotation
+    # TODO: implement global-only prompt with annotation (add support for local marking on global prompt)
     
-    # TODO: implement loading already trained models
-    # TODO: port the rabbitfire and balls examples
-    # TODO: implement sampling on entire dev set
+    # DONE: implement loading already trained models
+    # DONE: port the rabbitfire and balls examples
+    # TODO: implement generation on entire dev set
+    
+    # DONE: use scheduled sampling in doublecross sampling using threshold
     

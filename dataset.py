@@ -14,6 +14,8 @@ import numpy as np
 import colorsys
 from einops import rearrange, repeat
 
+from gradio_pww import _tokenize_annotated_prompt
+
 
 class ProcessedCOCOExample(object):
     def __init__(self, img_path=None, captions=None, regions=None, cropsize=None, img_data=None):       # img_data will be returned as-is when called .load_image()
@@ -543,7 +545,7 @@ class COCOPanopticExample(object):
         if isinstance(img, (str, Path)):
             self.image_path = img
         else:
-            assert isinstance(img, Image)
+            assert isinstance(img, (Image.Image,))
             self.image_data = img
         assert self.image_data is None or self.image_path is None       # provide either path or data
         self.captions = captions
@@ -551,7 +553,7 @@ class COCOPanopticExample(object):
         if isinstance(seg_img, (str, Path)):
             self.seg_path = seg_img
         else:
-            assert isinstance(seg_img, Image)
+            assert isinstance(seg_img, (Image.Image,))
             self.seg_data = img
         assert self.seg_data is None or self.seg_path is None       # provide either path or data
         self.seg_info = seg_info
@@ -836,6 +838,7 @@ class COCOPanopticDataset(IterableDataset):
         captions = []
         regionmasks = []
         layerids = []
+        encoder_layerids = []
         # regioncounts = []
         
         for example in examples:
@@ -844,6 +847,7 @@ class COCOPanopticDataset(IterableDataset):
             captions.append(torch.cat(example["captions"], 0))   # batchify captions
             # regioncounts.append(len(example["captions"]))  # keep track of the number of regions per example
             layerids.append(torch.cat(example["layerids"], 0))   # layer ids
+            encoder_layerids.append(torch.cat(example["encoder_layerids"], 0))   # layer ids
             materialized_masks = {res: masks[layerids[-1]] for res, masks in example["regionmasks"].items()}
             
             regionmasks.append(materialized_masks)
@@ -852,7 +856,8 @@ class COCOPanopticDataset(IterableDataset):
         cond_imagebatch = torch.stack(cond_images, dim=0)
         captionbatch = pad_sequence(captions, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         layeridsbatch = pad_sequence(layerids, batch_first=True, padding_value=-1)
-        captiontypes = [(layerids_i > 0).long() for layerids_i in layerids]
+        encoder_layeridsbatch = pad_sequence(encoder_layerids, batch_first=True, padding_value=-1)
+        captiontypes = [(layerids_i > 0).long() for layerids_i in encoder_layerids]
         captiontypes = pad_sequence(captiontypes, batch_first=True, padding_value=-2)
         captiontypes += 1
         captiontypes[:, 0] = 0
@@ -873,6 +878,7 @@ class COCOPanopticDataset(IterableDataset):
                 "cond_image": rearrange(cond_imagebatch, 'b c h w -> b h w c'),
                 "caption": captionbatch, 
                 "layerids": layeridsbatch, 
+                "encoder_layerids": encoder_layeridsbatch,
                 "regionmasks": batched_regionmasks, 
                 "captiontypes": captiontypes}
         
@@ -901,19 +907,21 @@ class COCOPanopticDataset(IterableDataset):
         # 4. load masks
         masks = [torch.ones_like(imgtensor[0], dtype=torch.bool)]
         # get the captions of the regions and build layer ids
+        region_code_to_layerid = {0: 0}
         
         for i, (region_code, region_info) in enumerate(example.seg_info.items()):
-            
             rgb = torch.tensor(region_code_to_rgb(region_code))
             region_mask = (seg_imgtensor == rgb[:, None, None]).all(0)
             if self.casmode != "global":
                 captions.append(region_info["caption"])
                 masks.append(region_mask)
+                region_code_to_layerid[region_code] = len(masks) - 1
             
             randomcolor = torch.tensor(randomcolor_hsv())
             maskcolor = region_mask.unsqueeze(0).repeat(3, 1, 1) * randomcolor[:, None, None]
         
             cond_imgtensor = torch.where(region_mask.unsqueeze(0) > 0.5, maskcolor, cond_imgtensor)
+            
 
         # append extra global prompt
         if self.simpleencode or self.casmode == "doublecross":
@@ -921,43 +929,64 @@ class COCOPanopticDataset(IterableDataset):
             comma = self.tokenize([","])[0, 1:-1]
             
         # encode separately
-        captions = [self.tokenize(caption, minimize_length=self.casmode != "global")[0] 
-                    for caption in captions]
+        tokenized_captions = []
         layerids = []
+        encoder_layerids = []
+        
+        minimize_length = False #self.casmode != "global"
         for i, caption in enumerate(captions):
-            layerids.append(torch.ones_like(caption) * i)
+            if i == 0:
+                tokenized_caption, layerids_e = _tokenize_annotated_prompt(caption, tokenizer=self.tokenizer, minimize_length=minimize_length)
+                # replace region codes with layer ids
+                for region_code, layerid in region_code_to_layerid.items():
+                    layerids_e = torch.masked_fill(layerids_e, layerids_e == region_code + 1, layerid)
+                tokenized_captions.append(tokenized_caption)
+                layerids.append(layerids_e)    
+            else:
+                tokenized_captions.append(self.tokenize(caption, tokenizer=self.tokenizer, minimize_length=minimize_length)[0])
+                layerids.append(torch.ones_like(tokenized_captions[-1]) * i)    
+            encoder_layerids.append(torch.ones_like(layerids[-1]) * i)
+        captions = tokenized_captions
             
         if self.simpleencode or self.casmode == "doublecross":
             # DONE: concatenate into one sentence. Make sure layer ids are matching up!  # DONE: make sure max len is not exceeded
-            ret_caption, ret_layerid = [], []
-            for i, (caption, layerid) in enumerate(zip(captions, layerids)):
+            ret_caption, ret_layerid, ret_encoder_layerid = [], [], []
+            for i, (caption, layerid, encoder_layerid) in enumerate(zip(captions, layerids, encoder_layerids)):
                 if i == 0:      # global prompt: discard EOS
                     ret_caption.append(caption[0:-1])
                     ret_layerid.append(layerid[0:-1])
+                    ret_encoder_layerid.append(encoder_layerid[0:-1])
                 else:     # region prompt: discard BOS and EOS
                     ret_caption.append(caption[1:-1])
                     ret_caption.append(comma)
                     ret_layerid.append(layerid[1:-1])
                     ret_layerid.append(torch.zeros_like(comma))
+                    ret_encoder_layerid.append(encoder_layerid[1:-1])
+                    ret_encoder_layerid.append(torch.zeros_like(comma))
             # remove last comma
             ret_caption.pop(-1)
             ret_layerid.pop(-1)
+            ret_encoder_layerid.pop(-1)
             # append EOS
             ret_caption.append(caption[-1:])
             ret_layerid.append(torch.zeros_like(layerid[-1:]))
+            ret_encoder_layerid.append(torch.zeros_like(encoder_layerid[-1:]))
             
-            ret_captions, ret_layerids = torch.cat(ret_caption, 0), torch.cat(ret_layerid, 0)
+            ret_captions, ret_layerids, ret_encoder_layerids = torch.cat(ret_caption, 0), torch.cat(ret_layerid, 0), torch.cat(ret_encoder_layerid, 0)
             # make sure that length does not exceed maximum length
             maxlen = self.tokenizer.model_max_length
             if len(ret_captions) > maxlen:
-                ret_captions, ret_layerids = ret_captions[:maxlen], ret_layerids[:maxlen]
-                ret_captions[-1], ret_layerids[-1] = self.tokenizer.eos_token_id, 0 
+                ret_captions, ret_layerids, ret_encoder_layerids = ret_captions[:maxlen], ret_layerids[:maxlen], ret_encoder_layerids[:maxlen]
+                ret_captions[-1], ret_layerids[-1], ret_encoder_layerids[-1] = self.tokenizer.eos_token_id, 0, 0
                 
             if self.simpleencode:
                 assert self.casmode != "doublecross"
-                captions, layerids = [ret_captions], [ret_layerids]
+                captions, layerids, encoder_layerids = [ret_captions], [ret_layerids], [ret_encoder_layerids]
             elif self.casmode == "doublecross":
-                captions[0], layerids[0] = ret_captions, (torch.zeros_like(ret_layerids))
+                captions[0], layerids[0], encoder_layerids[0] = ret_captions, (torch.zeros_like(ret_layerids)), (torch.zeros_like(ret_encoder_layerids))
+                
+        if "uselocal" not in self.casmode:
+            layerids[0] = encoder_layerids[0]
 
         # random square crop of size divisble by 64 and maximum size 512
         cropsize = min((min(imgtensor[0].shape) // 64) * 64, 512)
@@ -996,6 +1025,7 @@ class COCOPanopticDataset(IterableDataset):
                 "cond_image": cond_imgtensor,
                 "captions": captions,
                 "layerids": layerids,
+                "encoder_layerids": encoder_layerids,
                 "regionmasks": downmasktensors
                 }
     
@@ -1027,12 +1057,16 @@ class COCODataLoader(object):
     
 def main(x=0):
     import pickle
+    with open("coco2017.4dev.examples.pkl", "rb") as f:
+        loadedexamples = pickle.load(f)
+    # override pickled defaults
+    cocodataset = COCOPanopticDataset(examples=loadedexamples, casmode="sepswitch", simpleencode=False)
     # cocodataset = COCOPanopticDataset(maindir="/USERSPACE/lukovdg1/coco2017", split="train", casmode="doublecross", max_samples=None)
-    with open("coco2017.4.dev.pkl", "rb") as f:
-        cocodataset = pickle.load(f)
+    # with open("coco2017.4.dev.pkl", "rb") as f:
+    #     cocodataset = pickle.load(f)
     print(len(cocodataset))
     
-    dl = COCODataLoader(cocodataset, batch_size={384: 5, 448:4, 512: 4}, num_workers=8)
+    dl = COCODataLoader(cocodataset, batch_size={384: 5, 448:4, 512: 4}, num_workers=0)
     
     batch = next(iter(dl))
     # print(batch)

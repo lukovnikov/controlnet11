@@ -40,7 +40,7 @@ from annotator.pidinet import PidiNetDetector
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
 
-def _tokenize_annotated_prompt(prompt, tokenizer):
+def _tokenize_annotated_prompt(prompt, tokenizer, minimize_length=False):
     prompt = re.split(r"(\{[^\}]+\})", prompt)
     _prompt = []
     _layer_id = []
@@ -56,7 +56,7 @@ def _tokenize_annotated_prompt(prompt, tokenizer):
     for i in range(len(_prompt)):
         if i == len(_prompt) - 1:
             tokenized = tokenizer([_prompt[i]],
-                                  padding="max_length",
+                                  padding="max_length" if not minimize_length else "do_not_pad",
                                   max_length=tokenizer.model_max_length,
                                   return_overflowing_tokens=False,
                                   truncation=True,
@@ -404,10 +404,11 @@ class CustomCLIPTextEmbedder(FrozenCLIPEmbedder):
         text_embeddingses = []
         token_idses = []
         
-        layertexts = fullprompt.split("\n|")
+        layertexts = fullprompt.split("|")
         
         # encode layers separately
         for i, pos_prompt in enumerate(layertexts):
+            pos_prompt = pos_prompt.strip()
             if i == 0:
                 token_ids, layer_ids = _tokenize_annotated_prompt(pos_prompt.strip(), self.tokenizer)
                 global_len = token_ids.shape[0]
@@ -512,6 +513,16 @@ def unpack_layers(layers):
 
 
 class CustomControlLDM(ControlLDM):
+    def encode_using_text_encoder(self, input_ids):
+        outputs = self.cond_stage_model.transformer(input_ids=input_ids, output_hidden_states=self.cond_stage_model.layer=="hidden")
+        if self.cond_stage_model.layer == "last":
+            text_emb = outputs.last_hidden_state
+        elif self.cond_stage_model.layer == "pooled":
+            text_emb = outputs.pooler_output[:, None, :]
+        else:
+            text_emb = outputs.hidden_states[self.layer_idx]
+        return text_emb
+    
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
@@ -569,6 +580,7 @@ def create_tools(use_scribble_control=False):
     model.load_state_dict(load_state_dict('./models/v1-5-pruned.ckpt', location='cuda'), strict=False)
     model.load_state_dict(load_state_dict(f'./models/{model_name}.pth', location='cuda'), strict=False)
     model = model.cuda()
+    model.eval()
     ddim_sampler = DDIMSampler(model)
 
     # cast text encoder to our own
@@ -843,8 +855,8 @@ def run_default(inpfile="/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd
                 use_scribble_control=False,
                 ):
     guess_mode = False
-    a_prompt = 'best quality'
-    n_prompt = 'lowres, bad anatomy, bad hands, cropped, worst quality'
+    a_prompt = "" #'best quality'
+    n_prompt = "" #'lowres, bad anatomy, bad hands, cropped, worst quality'
     class InpFile:
         def __init__(self, f):
             self.name = f
@@ -969,11 +981,11 @@ def run_experiments_ediffi_pp_with_bos(controlonly=False, controlledonly=False, 
             pickle.dump(images, f)
             
             
-def run_experiments_posattn(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=True):
+def run_experiments_posattn(controlonly=False, controlledonly=False, inpfile="", use_scribble_control=False):
     model, sampler = create_tools(use_scribble_control=use_scribble_control)
     images = []
 
-    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls.psd" if inpfile == "" else inpfile    
+    filepath = "/USERSPACE/lukovdg1/datasets2/datasets/images/balls2.psd" if inpfile == "" else inpfile    
     p = Path(filepath)
     
     methodname = "PosAttn"
@@ -992,7 +1004,7 @@ def run_experiments_posattn(controlonly=False, controlledonly=False, inpfile="",
             pww_thresholds = [0.25, 0.5, 0.75]
             
         for t in pww_thresholds:
-            pww_strengths = [1., 2., 3.5,  5.]
+            pww_strengths = [0]  #[1., 2., 3.5,  5.]
             if t <= 0.3:
                 pww_strengths.append(10.)
             if t == 0.:
@@ -1321,7 +1333,7 @@ def main(server=False,
     # else: print("Choose what to run") ; run_experiments_sepswitch(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
     # else: print("Choose what to run") ; run_experiments_ediffi(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
     # else: print("Choose what to run") ; run_experiments_ediffi_pp_with_bos(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
-    else: print("Choose what to run") ; run_experiments_posattn_both(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
+    else: print("Choose what to run") ; run_experiments_posattn(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
     #else: print("Choose what to run") ; run_experiments_posattn_with_bos(controlonly=controlonly, controlledonly=controlledonly, inpfile=inpfile)
                             
 
