@@ -575,8 +575,9 @@ class COCOPanopticExample(object):
         
         
 class COCOPanopticDataset(IterableDataset):
-    def __init__(self, maindir:str=None, split="valid", max_masks=28, min_masks=2, max_samples=None, min_size=350,
-                 examples=None,
+    def __init__(self, maindir:str=None, split="valid", max_masks=10, min_masks=2, max_samples=None, min_size=350,
+                 examples=None, mergeregions=True, 
+                 regiondrop=True,           # if False, dropping examples with too many masks, if True: keeping all examples and dropping randomly some masks, if float: acts like True, but also drops some masks with the given number as drop probability
                  casmode=None, simpleencode=False,
                  tokenizer_version="openai/clip-vit-large-patch14"):
         super().__init__()
@@ -589,12 +590,18 @@ class COCOPanopticDataset(IterableDataset):
         self.casmode = casmode
         self.simpleencode = simpleencode
         
+        self.mergeregions = mergeregions
+        
+        self.max_masks = max_masks
+        self.min_masks = min_masks
         self.min_size = min_size
+        self.regiondrop = regiondrop
             
         sizestats = {}
         examplespersize = {}
         numtoofewregions = 0
         numtoomanyregions = 0
+        numtoosmall = 0
         
         numexamples = 0
         
@@ -624,6 +631,7 @@ class COCOPanopticDataset(IterableDataset):
                 frame_size = (image_db[example_id]["width"], image_db[example_id]["height"])
                 cropsize = min((min(frame_size) // 64) * 64, 512)
                 if cropsize < self.min_size:
+                    numtoosmall += 1
                     continue
                 
                 if cropsize not in sizestats:
@@ -631,7 +639,13 @@ class COCOPanopticDataset(IterableDataset):
                 sizestats[cropsize] += 1
                     
                 numregions = len(panoptic_db[example_id]["segments_info"])
-                if numregions > max_masks:
+                if self.mergeregions:
+                    uniqueregioncaptions = set()
+                    for _, region in panoptic_db[example_id]["segments_info"].items():
+                        uniqueregioncaptions.add(region["caption"])
+                    numregions = len(uniqueregioncaptions)
+                    
+                if numregions > max_masks and self.regiondrop is False:
                     numtoomanyregions += 1
                     continue
                 if numregions < min_masks:
@@ -695,6 +709,7 @@ class COCOPanopticDataset(IterableDataset):
         print(f"Retained examples: {len(self)}")
         print(f"Too many regions: {numtoomanyregions}")
         print(f"Too few regions: {numtoofewregions}")
+        print(f"Too small: {numtoosmall}")
         
     def filter_ids(self, ids):
         newselfexamples = []
@@ -909,81 +924,118 @@ class COCOPanopticDataset(IterableDataset):
         # get the captions of the regions and build layer ids
         region_code_to_layerid = {0: 0}
         
+        region_caption_to_layerid = {}
+        unique_region_captions = set()
+        
+        for _, region_info in example.seg_info.items():
+            unique_region_captions.add(region_info["caption"])
+            
+        if not (self.regiondrop is False):
+            all_unique_region_captions = list(unique_region_captions)
+            random.shuffle(all_unique_region_captions)
+            unique_region_captions = all_unique_region_captions[:self.max_masks]
+            if isinstance(self.regiondrop, float):
+                assert 0. <= self.regiondrop <= 1.
+                unique_region_captions = [c for c in unique_region_captions if random.random() > self.regiondrop]
+                if len(unique_region_captions) < self.min_masks:
+                    unique_region_captions = all_unique_region_captions[:self.min_masks]
+            unique_region_captions = set(unique_region_captions)
+        
         for i, (region_code, region_info) in enumerate(example.seg_info.items()):
             rgb = torch.tensor(region_code_to_rgb(region_code))
             region_mask = (seg_imgtensor == rgb[:, None, None]).all(0)
             if self.casmode != "global":
-                captions.append(region_info["caption"])
-                masks.append(region_mask)
-                region_code_to_layerid[region_code] = len(masks) - 1
+                region_caption = region_info["caption"]
+                if region_caption in unique_region_captions:
+                    if (not self.mergeregions) or (region_caption not in region_caption_to_layerid):
+                        new_layerid = len(masks)
+                        region_caption_to_layerid[region_caption] = new_layerid
+                        captions.append(region_info["caption"])
+                        masks.append(region_mask)
+                    else:
+                        new_layerid = region_caption_to_layerid[region_caption]
+                        masks[new_layerid] = masks[new_layerid] | region_mask        
+                    region_code_to_layerid[region_code] = new_layerid            
+                else:
+                    pass #continue    # or pass? (if pass, the mask will end up in the conditioning image for controlnet)
             
             randomcolor = torch.tensor(randomcolor_hsv())
             maskcolor = region_mask.unsqueeze(0).repeat(3, 1, 1) * randomcolor[:, None, None]
         
             cond_imgtensor = torch.where(region_mask.unsqueeze(0) > 0.5, maskcolor, cond_imgtensor)
             
-
+        extraexpressions = ["This image contains", "In this image are", "In this picture are", "This picture contains"]
         # append extra global prompt
-        if self.simpleencode or self.casmode == "doublecross":
-            captions[0] += ". This image contains "
-            comma = self.tokenize([","])[0, 1:-1]
+        if self.casmode == "doublecross":
+            assert not self.simpleencode
+            captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join([e for e in captions[1:]]) + "."
             
-        # encode separately
-        tokenized_captions = []
-        layerids = []
-        encoder_layerids = []
-        
-        minimize_length = False #self.casmode != "global"
-        for i, caption in enumerate(captions):
-            if i == 0:
-                tokenized_caption, layerids_e = _tokenize_annotated_prompt(caption, tokenizer=self.tokenizer, minimize_length=minimize_length)
-                # replace region codes with layer ids
-                for region_code, layerid in region_code_to_layerid.items():
-                    layerids_e = torch.masked_fill(layerids_e, layerids_e == region_code + 1, layerid)
-                tokenized_captions.append(tokenized_caption)
-                layerids.append(layerids_e)    
-            else:
-                tokenized_captions.append(self.tokenize(caption, tokenizer=self.tokenizer, minimize_length=minimize_length)[0])
-                layerids.append(torch.ones_like(tokenized_captions[-1]) * i)    
-            encoder_layerids.append(torch.ones_like(layerids[-1]) * i)
-        captions = tokenized_captions
+        if self.simpleencode:   # or self.casmode == "doublecross":
+            tojoin = []
+            for i, capt in enumerate(captions[1:]):
+                tojoin.append(f"{{{capt}:{i}}}")
+            captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join(tojoin) + "."
             
-        if self.simpleencode or self.casmode == "doublecross":
-            # DONE: concatenate into one sentence. Make sure layer ids are matching up!  # DONE: make sure max len is not exceeded
-            ret_caption, ret_layerid, ret_encoder_layerid = [], [], []
-            for i, (caption, layerid, encoder_layerid) in enumerate(zip(captions, layerids, encoder_layerids)):
-                if i == 0:      # global prompt: discard EOS
-                    ret_caption.append(caption[0:-1])
-                    ret_layerid.append(layerid[0:-1])
-                    ret_encoder_layerid.append(encoder_layerid[0:-1])
-                else:     # region prompt: discard BOS and EOS
-                    ret_caption.append(caption[1:-1])
-                    ret_caption.append(comma)
-                    ret_layerid.append(layerid[1:-1])
-                    ret_layerid.append(torch.zeros_like(comma))
-                    ret_encoder_layerid.append(encoder_layerid[1:-1])
-                    ret_encoder_layerid.append(torch.zeros_like(comma))
-            # remove last comma
-            ret_caption.pop(-1)
-            ret_layerid.pop(-1)
-            ret_encoder_layerid.pop(-1)
-            # append EOS
-            ret_caption.append(caption[-1:])
-            ret_layerid.append(torch.zeros_like(layerid[-1:]))
-            ret_encoder_layerid.append(torch.zeros_like(encoder_layerid[-1:]))
+            captions, layerids = _tokenize_annotated_prompt(caption[0], tokenizer=self.tokenizer, minimize_length=minimize_length)
+            captions, layerids = [captions], [layerids]
+            encoder_layerids = [torch.ones_like(layerids[-1]) * i]
+        else:
+            # encode separately
+            tokenized_captions = []
+            layerids = []
+            encoder_layerids = []
             
-            ret_captions, ret_layerids, ret_encoder_layerids = torch.cat(ret_caption, 0), torch.cat(ret_layerid, 0), torch.cat(ret_encoder_layerid, 0)
-            # make sure that length does not exceed maximum length
-            maxlen = self.tokenizer.model_max_length
-            if len(ret_captions) > maxlen:
-                ret_captions, ret_layerids, ret_encoder_layerids = ret_captions[:maxlen], ret_layerids[:maxlen], ret_encoder_layerids[:maxlen]
-                ret_captions[-1], ret_layerids[-1], ret_encoder_layerids[-1] = self.tokenizer.eos_token_id, 0, 0
+            minimize_length = False #self.casmode != "global"
+            for i, caption in enumerate(captions):
+                if i == 0:
+                    tokenized_caption, layerids_e = _tokenize_annotated_prompt(caption, tokenizer=self.tokenizer, minimize_length=minimize_length)
+                    # replace region codes with layer ids
+                    for region_code, layerid in region_code_to_layerid.items():
+                        layerids_e = torch.masked_fill(layerids_e, layerids_e == region_code + 1, layerid)
+                    tokenized_captions.append(tokenized_caption)
+                    layerids.append(layerids_e)    
+                else:
+                    tokenized_captions.append(self.tokenize(caption, tokenizer=self.tokenizer, minimize_length=minimize_length)[0])
+                    layerids.append(torch.ones_like(tokenized_captions[-1]) * i)    
+                encoder_layerids.append(torch.ones_like(layerids[-1]) * i)
+            captions = tokenized_captions
+            
+        # if self.simpleencode:   # or self.casmode == "doublecross":
+        #     # DONE: concatenate into one sentence. Make sure layer ids are matching up!  # DONE: make sure max len is not exceeded
+        #     ret_caption, ret_layerid, ret_encoder_layerid = [], [], []
+        #     for i, (caption, layerid, encoder_layerid) in enumerate(zip(captions, layerids, encoder_layerids)):
+        #         if i == 0:      # global prompt: discard EOS
+        #             ret_caption.append(caption[0:-1])
+        #             ret_layerid.append(layerid[0:-1])
+        #             ret_encoder_layerid.append(encoder_layerid[0:-1])
+        #         else:     # region prompt: discard BOS and EOS
+        #             ret_caption.append(caption[1:-1])
+        #             ret_caption.append(comma)
+        #             ret_layerid.append(layerid[1:-1])
+        #             ret_layerid.append(torch.zeros_like(comma))
+        #             ret_encoder_layerid.append(encoder_layerid[1:-1])
+        #             ret_encoder_layerid.append(torch.zeros_like(comma))
+        #     # remove last comma
+        #     ret_caption.pop(-1)
+        #     ret_layerid.pop(-1)
+        #     ret_encoder_layerid.pop(-1)
+        #     # append EOS
+        #     ret_caption.append(caption[-1:])
+        #     ret_layerid.append(torch.zeros_like(layerid[-1:]))
+        #     ret_encoder_layerid.append(torch.zeros_like(encoder_layerid[-1:]))
+            
+        #     ret_captions, ret_layerids, ret_encoder_layerids = torch.cat(ret_caption, 0), torch.cat(ret_layerid, 0), torch.cat(ret_encoder_layerid, 0)
+        #     # make sure that length does not exceed maximum length
+        #     maxlen = self.tokenizer.model_max_length
+        #     if len(ret_captions) > maxlen:
+        #         ret_captions, ret_layerids, ret_encoder_layerids = ret_captions[:maxlen], ret_layerids[:maxlen], ret_encoder_layerids[:maxlen]
+        #         ret_captions[-1], ret_layerids[-1], ret_encoder_layerids[-1] = self.tokenizer.eos_token_id, 0, 0
                 
-            if self.simpleencode:
-                assert self.casmode != "doublecross"
-                captions, layerids, encoder_layerids = [ret_captions], [ret_layerids], [ret_encoder_layerids]
-            elif self.casmode == "doublecross":
-                captions[0], layerids[0], encoder_layerids[0] = ret_captions, (torch.zeros_like(ret_layerids)), (torch.zeros_like(ret_encoder_layerids))
+        #     # if self.simpleencode:
+        #     assert self.casmode != "doublecross"
+        #     captions, layerids, encoder_layerids = [ret_captions], [ret_layerids], [ret_encoder_layerids]
+        #     # elif self.casmode == "doublecross":
+        #     #     captions[0], layerids[0], encoder_layerids[0] = ret_captions, (torch.zeros_like(ret_layerids)), (torch.zeros_like(ret_encoder_layerids))
                 
         if "uselocal" not in self.casmode:
             layerids[0] = encoder_layerids[0]
@@ -1030,7 +1082,6 @@ class COCOPanopticDataset(IterableDataset):
                 }
     
     
-
 class COCODataLoader(object):
     def __init__(self, cocodataset:COCODataset, batch_size=2, shuffle=False, num_workers=0) -> None:
         super().__init__()
@@ -1060,8 +1111,9 @@ def main(x=0):
     with open("coco2017.4dev.examples.pkl", "rb") as f:
         loadedexamples = pickle.load(f)
     # override pickled defaults
-    cocodataset = COCOPanopticDataset(examples=loadedexamples, casmode="sepswitch", simpleencode=False)
-    # cocodataset = COCOPanopticDataset(maindir="/USERSPACE/lukovdg1/coco2017", split="train", casmode="doublecross", max_samples=None)
+    # cocodataset = COCOPanopticDataset(examples=loadedexamples, casmode="sepswitch", simpleencode=False, mergeregions=True)
+    cocodataset = COCOPanopticDataset(maindir="/USERSPACE/lukovdg1/coco2017", split="train", regiondrop=0.5,
+                                      casmode="doublecross", simpleencode=False, max_samples=None, mergeregions=True)
     # with open("coco2017.4.dev.pkl", "rb") as f:
     #     cocodataset = pickle.load(f)
     print(len(cocodataset))

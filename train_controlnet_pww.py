@@ -557,6 +557,97 @@ class CustomCrossAttentionExt(CustomCrossAttentionBase):
         params += list(self.progress_emb.parameters())
         return params
     
+    
+class CustomCrossAttentionExt2(CustomCrossAttentionBase):
+    # DONE: add model extension to be able to tell where is global and local parts of the prompt
+        
+    def init_extra(self):
+        # conditioning on token type (global BOS, global or local)
+        self.token_type_emb = TokenTypeEmbedding(self.to_k.in_features)
+        
+        for p in self.get_trainable_parameters():
+            p.train_param = True
+
+    def forward(self, x, context=None, mask=None):
+        h = self.heads
+        
+        if context is not None:
+            context = context["c_crossattn"][0]
+            contextembs = context.embs
+        else:
+            assert False        # this shouldn't be used as self-attention
+            contextembs = x
+            
+        typeemb = self.token_type_emb(context.captiontypes, contextembs)
+
+        q = self.to_q(x)
+        k = self.to_k(contextembs + typeemb)
+        v = self.to_v(contextembs)
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        # force cast to fp32 to avoid overflowing
+        if _ATTN_PRECISION =="fp32":
+            with torch.autocast(enabled=False, device_type = 'cuda'):
+                q, k = q.float(), k.float()
+                sim = einsum('b i d, b j d -> b i j', q, k)
+        else:
+            sim = einsum('b i d, b j d -> b i j', q, k)
+        
+        del q, k
+
+        if mask is not None:
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+
+        if context is not None:     # cross-attention
+            sim = self.cross_attention_control(sim, context, numheads=h)
+        
+        # attention
+        sim = (sim * self.scale).softmax(dim=-1)
+
+        out = einsum('b i j, b j d -> b i d', sim, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        return self.to_out(out)
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        #apply mask on sim
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.captiontypes >= 2
+        mask = repeat(mask, 'b j -> (b h) () j', h=numheads)
+        
+        # get mask that selects global as well as applicable local prompt
+        wf = self.weight_func(sim, context, sim_mask=mask)
+
+        # expand dimensions to match heads
+        wf = wf[:, None].repeat(1, numheads, 1, 1)
+        wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
+        
+        # remove the global part from the mask
+        wf.masked_fill_(~mask, 0)  # max_neg_value)
+        
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        wfmaxes = wf.max(-1, keepdim=True)[0]
+        wf = (wf >= (wfmaxes.clamp_min(1e-3) - 1e-4))
+        
+        # get mask that selects only global tokens
+        gmask = (context.captiontypes >= 0) & (context.captiontypes < 2)
+        gmask = repeat(gmask, 'b j -> (b h) () j', h=numheads)
+        
+        # update stimulation to attend to global tokens when no local tokens are available
+        lmask = wf | gmask
+        
+        sim.masked_fill_(~lmask, max_neg_value)
+        return sim
+    
+    def get_trainable_parameters(self):
+        params = list(self.to_q.parameters())
+        params += list(self.to_k.parameters())
+        params += list(self.token_type_emb.parameters())
+        return params
+    
         
 class TokenTypeEmbeddingMinimal(torch.nn.Module):
     def __init__(self, embdim):
@@ -628,21 +719,11 @@ class CustomCrossAttentionMinimal(CustomCrossAttentionExt):
     
     def init_extra(self):
         self.progressclassifier = ProgressClassifier(numheads=self.heads)
-        # # conditioning on token type (global BOS, global or local)
-        # self.token_type_emb = TokenTypeEmbeddingMinimal(self.to_k.out_features)
-        # # conditioning on progress (0..1)
-        # self.progress_emb = ProgressEmbeddingMinimal(self.to_q.out_features)
-        # # gate parameters: one trainable scalar for every head in this attention layer
-        # self.gate = torch.nn.Parameter(torch.randn(self.heads) * 1e-6)      # 
-        
         for p in self.get_trainable_parameters():
             p.train_param = True
         
     def get_trainable_parameters(self):
         params = list(self.progressclassifier.parameters())
-        # params = list(self.token_type_emb.parameters())
-        # params += list(self.progress_emb.parameters())
-        # params += [self.gate]
         return params
         
     def forward(self, x, context=None, mask=None):
@@ -694,7 +775,6 @@ class CustomCrossAttentionMinimal(CustomCrossAttentionExt):
         
         # get mask that selects global as well as applicable local prompt
         wf = self.weight_func(sim, context, sim_mask=mask)
-        wfscale = wf.max()
 
         # expand dimensions to match heads
         wf = wf[:, None].repeat(1, numheads, 1, 1)
@@ -725,16 +805,6 @@ class CustomCrossAttentionMinimal(CustomCrossAttentionExt):
         progressclasses = self.progressclassifier(context.progress).view(-1, 2)
         attn = gattn.float() * progressclasses[:, 0][:, None, None] + lattn.float() * progressclasses[:, 1][:, None, None]
         return attn
-        
-        
-        # cas_mask = gmask.float() * progressclasses[:, 0][:, None, None] + lmask.float() * progressclasses[:, 1][:, None, None]
-        # cas_mask = cas_mask * wfscale
-        # sim = sim + cas_mask
-        
-        # sim.masked_fill_((lmask | gmask) == 0, max_neg_value)
-        # sim = sim + wf
-        # sim = (sim * self.scale).softmax(dim=-1)
-        # return sim
 
 
 class ControlPWWLDM(ControlLDM):
@@ -745,6 +815,9 @@ class ControlPWWLDM(ControlLDM):
     # @torch.no_grad()
     # def get_input(self, batch, k, bs=None, *args, **kwargs):
     #     # takes a batch and outputs image x and conditioning info c  --> keep unchanged
+    
+    def set_control_drop(self, p=0.):
+        self.control_drop = p
     
     def encode_using_text_encoder(self, input_ids):
         outputs = self.cond_stage_model.transformer(input_ids=input_ids, output_hidden_states=self.cond_stage_model.layer=="hidden")
@@ -857,9 +930,12 @@ class ControlPWWLDM(ControlLDM):
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond, control=None, only_mid_control=self.only_mid_control)
         else:
+            scalemult = 1.
+            if self.training and hasattr(self, "control_drop") and self.control_drop > 0.:      # control drop during training
+                scalemult = 1. if random.random() > self.control_drop else 0.
             # cond["c_crossattn"].on_before_control()
             control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond)
-            control = [c * scale for c, scale in zip(control, self.control_scales)]
+            control = [c * scale * scalemult for c, scale in zip(control, self.control_scales)]
             if self.global_average_pooling:
                 control = [torch.mean(c, dim=(2, 3), keepdim=True) for c in control]
             # cond["c_crossattn"].on_before_controlled()
@@ -1104,6 +1180,7 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
                      "local": CustomCrossAttentionBaselineLocal,
                      "global": CustomCrossAttentionBaselineGlobal,
                      "bothext": CustomCrossAttentionExt,
+                     "bothext2": CustomCrossAttentionExt2,
                      "bothminimal": CustomCrossAttentionMinimal,
                      "doublecross": None,
                      "sepswitch": CustomCrossAttentionSepSwitch,
@@ -1273,19 +1350,22 @@ def main(batsize=5,
          version="v4",
          datadir="/USERSPACE/lukovdg1/coco2017/",
          devexamples="coco2017.4dev.examples.pkl,extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
-         cas="bothext",  # "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
+         cas="doublecross",  # "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
          devices=(0,),
          numtrain=-1,
+         regiondrop=0.,
+         controldrop=0.,
          forreal=False,
          seed=42,        # seed for training
          log_image_seed=41,     # seed for generating logging images
          freezedown=False,      # don't adapt the down-sampling blocks of the Unet, only change and train the upsamling blocks
          freezecontrol=False,
          simpleencode=False,    # encode both global and all local prompts as one sequence
-         generate="alldev",   # ""
-         threshold=1.,
-        #  loadckpt="", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
-         loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/latest_all_epoch=epoch=9_step=step=100710.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
+        #  generate="alldev",   # ""
+        generate="",
+         threshold=0.2,
+         loadckpt="", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
+        #  loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/latest_all_epoch=epoch=9_step=step=100710.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
          ):  
     args = locals().copy()
     # print(args)
@@ -1293,7 +1373,7 @@ def main(batsize=5,
     ### usage
     # simpleencode=True: only makes sense with both or bothext
     if simpleencode:
-        assert cas in ("bothext", "bothminimal")
+        assert cas in ("bothext", "bothext2", "bothminimal")
     print(devices, type(devices), devices[0])
     # Configs
     batch_size = batsize
@@ -1334,6 +1414,7 @@ def main(batsize=5,
     
     model = create_controlnet_pww_model(cas_name=cas, freezedown=freezedown, simpleencode=simpleencode, 
                                         threshold=threshold, loadckpt=loadckpt)
+    model.set_control_drop(controldrop)
     
     seedswitch = SeedSwitch(seed, log_image_seed)
     image_logger = ImageLogger(batch_frequency=logger_freq, dl=valid_dl, seed=seedswitch)
@@ -1349,7 +1430,8 @@ def main(batsize=5,
     
     else:
         ds = COCOPanopticDataset(maindir=datadir, split="train" if forreal else "valid", casmode=cas, simpleencode=simpleencode, 
-                        max_samples=numtrain if numtrain is not None else (None if forreal else 1000))
+                        max_samples=numtrain if numtrain is not None else (None if forreal else 1000),
+                        regiondrop=regiondrop, mergeregions=True)
         
         print(len(ds))
         batsizes = {384: round(batch_size * 2.4), 448:round(batch_size * 1.4), 512: batch_size}
@@ -1409,13 +1491,12 @@ if __name__ == "__main__":
     # DONE: create minimal variant where there is only interaction between layer+head info, progress and token type (global/local/bos) (<-- essentially a learned schedule for CAS, independent of content)
     # WONTDOFORNOWTODO: create variant that combines regular and simple encode
     
-    # TODO: train CAS better by dropping out the ControlNet control (because ControlNet already implies some object identity with its shapes)
+    # DONE: train CAS better by dropping out the ControlNet control (because ControlNet already implies some object identity with its shapes)
     
     # DONE: IDEA: double-cross-attention: one cross attention on global prompt (unchanged, untrained?), and another cross-attention on local prompts
     
     # DONE: validation setup: take images of apples and oranges and of cats and dogs and change where the cats and dogs and apples and oranges are
     # DONE: use panoptic segmentation data from COCO instead
-    # TODO(?): drop some regions
     
     # TODO: evaluation setup --> RegionCLIP?
     
@@ -1430,11 +1511,26 @@ if __name__ == "__main__":
     # BASELINES
     # DONE: implement clean global cas here
     # DONE: implement switching from local-only to global-only
-    # TODO: implement global-only prompt with annotation (add support for local marking on global prompt)
     
     # DONE: implement loading already trained models
     # DONE: port the rabbitfire and balls examples
     # TODO: implement generation on entire dev set
     
     # DONE: use scheduled sampling in doublecross sampling using threshold
+    
+    # DONE: data optimization: If label is the same, keep only one encoding of the label and collapse the masks
+    # DONE: data optimization: randomly drop regions when there are too many
+    
+    # DONE: is there anything wrong in bothext mode, why do the initial images often look so weird and glitchy?
+            # => images look fine after training
+            
+    
+    # DONE: bothext2: variant that doesn't explicitly attach timestep info to query vectors
+    
+    # TODO: implement "delegated" mode that automatically converts to gradio_pww-style conditioning object
+    # TODO: implement global-only prompt with annotation (add support for local marking on global prompt) --> delegated
+    
+    # TODO: check why we no longer get glitchy initial images with bothext
+    # TODO: check sepswitch mode
+    # DONE: check and rerun bothminimal and doublecross
     

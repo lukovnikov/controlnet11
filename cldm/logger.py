@@ -23,7 +23,7 @@ def nested_to(x, device):
 
 
 class ImageLogger(Callback):
-    def __init__(self, batch_frequency=2000, max_images=4, clamp=True, increase_log_steps=True, seed=42,
+    def __init__(self, batch_frequency=2000, max_images=-1, clamp=True, increase_log_steps=True, seed=42,
                  rescale=True, disabled=False, log_on_batch_idx=False, log_first_step=False,
                  log_images_kwargs=None, dl=None):
         super().__init__()
@@ -56,7 +56,7 @@ class ImageLogger(Callback):
             os.makedirs(os.path.split(path)[0], exist_ok=True)
             Image.fromarray(grid).save(path)
             
-    def do_log_img(self, pl_module, split="train"):
+    def do_log_img(self, pl_module, save_dir, split="train"):
         is_train = pl_module.training
         if is_train:
             pl_module.eval()
@@ -79,10 +79,10 @@ class ImageLogger(Callback):
                     if self.clamp:
                         images[k] = torch.clamp(images[k], -1., 1.)
 
-            self.log_local(pl_module.logger.save_dir, split, images,
+            self.log_local(save_dir, split, images,
                         pl_module.global_step, pl_module.current_epoch, batch_idx)
             
-            if numgenerated >= self.max_images:
+            if self.max_images >= 0 and numgenerated >= self.max_images:
                 break
 
         if is_train:
@@ -96,10 +96,9 @@ class ImageLogger(Callback):
         # if self.log_on_batch_idx else pl_module.global_step
         if (self.check_frequency(global_step) and  # batch_idx % self.batch_freq == 0
                 hasattr(pl_module, "log_images") and
-                callable(pl_module.log_images) and
-                self.max_images > 0):
+                callable(pl_module.log_images)):
             # logger = type(pl_module.logger)
-            self.do_log_img(pl_module=pl_module, split=split)
+            self.do_log_img(pl_module=pl_module, save_dir=pl_module.logger.save_dir, split=split)
             
         if isinstance(self.seed, SeedSwitch):
             self.seed.__exit__(None, None, None)
