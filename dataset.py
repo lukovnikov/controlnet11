@@ -575,10 +575,12 @@ class COCOPanopticExample(object):
         
         
 class COCOPanopticDataset(IterableDataset):
+    padlimit=1 #5
+    
     def __init__(self, maindir:str=None, split="valid", max_masks=10, min_masks=2, max_samples=None, min_size=350,
                  examples=None, mergeregions=True, 
                  regiondrop=True,           # if False, dropping examples with too many masks, if True: keeping all examples and dropping randomly some masks, if float: acts like True, but also drops some masks with the given number as drop probability
-                 casmode=None, simpleencode=False,
+                 casmode=None, simpleencode=False, limitpadding=False,
                  tokenizer_version="openai/clip-vit-large-patch14"):
         super().__init__()
         assert examples is None or maindir is None      # provide either a directory or a list of already made examples
@@ -587,15 +589,19 @@ class COCOPanopticDataset(IterableDataset):
         self.tokenizer_version = tokenizer_version
         self.load_tokenizer()
         
-        self.casmode = casmode
+        self.casmodechunks = casmode.split("+")
+        self.casmode = self.casmodechunks[0]
         self.simpleencode = simpleencode
         
+        self.use_local = "uselocal" in self.casmodechunks
+        
         self.mergeregions = mergeregions
+        self.limitpadding = limitpadding
         
         self.max_masks = max_masks
         self.min_masks = min_masks
         self.min_size = min_size
-        self.regiondrop = regiondrop
+        self.regiondrop = regiondrop if regiondrop != -1. else False
             
         sizestats = {}
         examplespersize = {}
@@ -964,28 +970,28 @@ class COCOPanopticDataset(IterableDataset):
         
             cond_imgtensor = torch.where(region_mask.unsqueeze(0) > 0.5, maskcolor, cond_imgtensor)
             
-        extraexpressions = ["This image contains", "In this image are", "In this picture are", "This picture contains"]
         # append extra global prompt
-        if self.casmode == "doublecross":
+        if self.casmode == "doublecross" and not ("keepprompt" in self.casmodechunks or "test" in self.casmodechunks):
             assert not self.simpleencode
+            extraexpressions = ["This image contains", "In this image are", "In this picture are", "This picture contains"]
             captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join([e for e in captions[1:]]) + "."
             
+        minimize_length = False
         if self.simpleencode:   # or self.casmode == "doublecross":
             tojoin = []
             for i, capt in enumerate(captions[1:]):
                 tojoin.append(f"{{{capt}:{i}}}")
             captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join(tojoin) + "."
             
-            captions, layerids = _tokenize_annotated_prompt(caption[0], tokenizer=self.tokenizer, minimize_length=minimize_length)
+            captions, layerids = _tokenize_annotated_prompt(captions[0], tokenizer=self.tokenizer, minimize_length=minimize_length)
             captions, layerids = [captions], [layerids]
-            encoder_layerids = [torch.ones_like(layerids[-1]) * i]
+            encoder_layerids = [torch.ones_like(layerids[-1]) * 0]
         else:
             # encode separately
             tokenized_captions = []
             layerids = []
             encoder_layerids = []
-            
-            minimize_length = False #self.casmode != "global"
+             #self.casmode != "global"
             for i, caption in enumerate(captions):
                 if i == 0:
                     tokenized_caption, layerids_e = _tokenize_annotated_prompt(caption, tokenizer=self.tokenizer, minimize_length=minimize_length)
@@ -999,6 +1005,23 @@ class COCOPanopticDataset(IterableDataset):
                     layerids.append(torch.ones_like(tokenized_captions[-1]) * i)    
                 encoder_layerids.append(torch.ones_like(layerids[-1]) * i)
             captions = tokenized_captions
+            if not self.use_local:
+                layerids[0] = encoder_layerids[0]
+            else:
+                # retain only first ones
+                captions = [captions[0]]
+                layerids = [layerids[0]]
+                encoder_layerids = [encoder_layerids[0]]
+                
+        if self.limitpadding:
+            for i in range(len(captions)):
+                caption = captions[i]
+                numberpads = (caption == self.tokenizer.pad_token_id).sum()     # assumption: all pads are contiguous and at the end
+                endidx = -(numberpads - self.padlimit)
+                captions[i] = caption[:endidx]
+                layerids[i] = layerids[i][:endidx]
+                encoder_layerids[i] = encoder_layerids[i][:endidx]
+                    
             
         # if self.simpleencode:   # or self.casmode == "doublecross":
         #     # DONE: concatenate into one sentence. Make sure layer ids are matching up!  # DONE: make sure max len is not exceeded
@@ -1037,8 +1060,6 @@ class COCOPanopticDataset(IterableDataset):
         #     # elif self.casmode == "doublecross":
         #     #     captions[0], layerids[0], encoder_layerids[0] = ret_captions, (torch.zeros_like(ret_layerids)), (torch.zeros_like(ret_encoder_layerids))
                 
-        if "uselocal" not in self.casmode:
-            layerids[0] = encoder_layerids[0]
 
         # random square crop of size divisble by 64 and maximum size 512
         cropsize = min((min(imgtensor[0].shape) // 64) * 64, 512)
@@ -1113,7 +1134,7 @@ def main(x=0):
     # override pickled defaults
     # cocodataset = COCOPanopticDataset(examples=loadedexamples, casmode="sepswitch", simpleencode=False, mergeregions=True)
     cocodataset = COCOPanopticDataset(maindir="/USERSPACE/lukovdg1/coco2017", split="train", regiondrop=0.5,
-                                      casmode="doublecross", simpleencode=False, max_samples=None, mergeregions=True)
+                                      casmode="bothext", simpleencode=True, max_samples=None, mergeregions=True)
     # with open("coco2017.4.dev.pkl", "rb") as f:
     #     cocodataset = pickle.load(f)
     print(len(cocodataset))

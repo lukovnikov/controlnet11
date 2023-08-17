@@ -100,7 +100,14 @@ class CustomTextConditioning():
         
     def cross_attention_control(self, sim):
         """ Takes the unscaled unnormalized attention scores computed by cross-attention module, returns adapted attention scores. """
-        sim = sim + self.weight_func(sim)
+        ret = self.weight_func(sim)
+        if ret.shape[0] != sim.shape[0]:
+            # expand dimensions to match heads
+            numheads = sim.shape[0] // ret.shape[0]
+            ret = ret[:, None].repeat(1, numheads, 1, 1)
+            ret = ret.view(-1, ret.shape[-2], ret.shape[-1])
+            
+        sim = sim + ret
         return sim
     
     def weight_func(self, sim):
@@ -141,7 +148,10 @@ class CustomTextConditioning():
                 "Ediffi": ediffi_weight_func,
                 "Ediffi++": ediffi_pp_weight_func,
                 "Ediffi++:WithBOS": ediffi_pp_with_bos_weight_func,
+                "NewEdiffi": ediffi_weight_func_new,
+                "NewEdiffipp": ediffi_pp_weight_func_new,
                 "PosAttn": posattn_weight_func,
+                "NewPosAttn": posattn_weight_func_new,
                 "PosAttn:WithBOS": posattn_with_bos_weight_func,
                 "PosAttn:RaiseBOS": posattn_raise_bos_weight_func,
                 "PosAttn:Both": posattn_both_weight_func,
@@ -203,8 +213,39 @@ def ediffi_weight_func(self, sim, sigma_square=False, qk_std=False, **kw):
     return ret
 
 
+def ediffi_weight_func_new(self, sim, sigma_square=False, qk_std=False, **kw):
+    # Positive attention with threshold uses the global prompt with layer annotations and adds the cross-attention mask to the attention scores
+    
+    # create negative mask that completely ignores non-global prompts
+    globalmask = self.global_prompt_mask[:, None].to(sim.dtype)
+    max_neg_value = -torch.finfo(sim.dtype).max
+    
+    mask = self.cross_attn_masks[sim.shape[1]]
+    mask2 = (self.layer_ids[:, None] != 0).to(sim.dtype).to(sim.device)
+    # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
+    boostmask = mask * mask2        # selects only those tokens not belonging to any regional description
+    # negmask = (1 - mask) * mask2
+    
+    weight = self.strength * torch.log(1 + (self.sigma_t **2 if sigma_square else self.sigma_t)) * (sim.std() if qk_std else sim.max())
+    # a, b = max(0, self.threshold - self.softness / 2), min(self.threshold + self.softness / 2, 1)
+    
+    # weight = 1 - _threshold_f(self.progress, a, b)
+    
+    # get the cross attention mask for the right resolution and multiply with final mask strength
+    # ret = boostmask * weight * self.strength * sim.std()
+    ret = boostmask * weight[:, None, None]
+    ret.masked_fill_(globalmask < 0.5, max_neg_value)
+    # ret.masked_fill_(negmask > 0.5, max_neg_value)
+    
+    return ret
+
+
 def ediffi_pp_weight_func(self, sim, sigma_square=True, qk_std=True, **kw):
     return ediffi_weight_func(self, sim, sigma_square=sigma_square, qk_std=qk_std, **kw)
+
+
+def ediffi_pp_weight_func_new(self, sim, sigma_square=True, qk_std=True, **kw):
+    return ediffi_weight_func_new(self, sim, sigma_square=sigma_square, qk_std=qk_std, **kw)
 
 
 def ediffi_pp_with_bos_weight_func(self, sim, sigma_square=True, qk_std=True, **kw):
@@ -246,13 +287,22 @@ def _threshold_f(p, a, b=1): # transitions from 0 at p=a to 1 at p=b using sinus
     a = min(b, a)
     a = max(a, 0)
     b = max(a, b)
-    if p <= a:
-        weight = 0
-    elif p > a and p < b:
+    
+    if isinstance(p, torch.Tensor) and p.dim() == 1 and len(p) > 1:
+        weight = torch.zeros_like(p)
+        weight.masked_fill_(p >= b, 1)
         midpoint = (b - a) / 2 + a
-        weight = (math.sin(math.pi * (p - midpoint) / (b - a)) + 1) * 0.5
+        midweight = (torch.sin(math.pi * (p - midpoint) / (b - a)) + 1) * 0.5
+        weight = torch.where((p < b) & (p > a), midweight, weight)
+        # weight = weight[:, None, None]
     else:
-        weight = 1
+        if p <= a:
+            weight = 0
+        elif p > a and p < b:
+            midpoint = (b - a) / 2 + a
+            weight = (math.sin(math.pi * (p - midpoint) / (b - a)) + 1) * 0.5
+        else:
+            weight = 1
     return weight
 
 
@@ -271,6 +321,31 @@ def posattn_weight_func(self, sim, **kw):
     mask = self.cross_attn_masks[sim.shape[1]]
     ret = mask * weight * self.strength * sim.std()
     ret.masked_fill_(negmask > 0.5, max_neg_value)
+    return ret
+
+
+def posattn_weight_func_new(self, sim, **kw):
+    # Positive attention with threshold uses the global prompt with layer annotations and adds the cross-attention mask to the attention scores
+    
+    # create negative mask that completely ignores non-global prompts
+    globalmask = self.global_prompt_mask[:, None].to(sim.dtype)
+    max_neg_value = -torch.finfo(sim.dtype).max
+    
+    mask = self.cross_attn_masks[sim.shape[1]]
+    mask2 = (self.layer_ids[:, None] != 0).to(sim.dtype).to(sim.device)
+    # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
+    boostmask = mask * mask2        # selects only those tokens not belonging to any regional description
+    negmask = (1 - mask) * mask2
+    
+    a, b = max(0, self.threshold - self.softness / 2), min(self.threshold + self.softness / 2, 1)
+    
+    weight = 1 - _threshold_f(self.progress, a, b)[:, None, None]
+    
+    # get the cross attention mask for the right resolution and multiply with final mask strength
+    ret = boostmask * weight * self.strength * sim.std()
+    ret.masked_fill_(globalmask < 0.5, max_neg_value)
+    ret.masked_fill_(negmask > 0.5, max_neg_value)
+    
     return ret
 
 

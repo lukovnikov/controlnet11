@@ -187,6 +187,11 @@ class CustomCrossAttentionBaseline(CustomCrossAttentionBase):
         params += list(self.to_k.parameters())
         return params
     
+    
+class CustomCrossAttentionLegacy(CustomCrossAttentionBaseline):
+    def cross_attention_control(self, sim, context, numheads=None):
+        return context.cross_attention_control(sim)
+    
 
 class CustomCrossAttentionDelegated(CustomCrossAttentionBaseline):      # delegated cross attention manipulation to the context object
     def cross_attention_control(self, sim, context, numheads=None):
@@ -361,7 +366,8 @@ class DoublecrossBasicTransformerBlock(BasicTransformerBlock):
         else:
             threshold_gate = (context["c_crossattn"][0].progress < self.threshold).float()
             if torch.any(threshold_gate):
-                x = threshold_gate[:, None, None] * self.manual_gate * torch.tanh(self.learned_gate) * self.attn2l(self.norm2l(x), context=context) + x
+                x = threshold_gate[:, None, None] * self.manual_gate * \
+                    torch.tanh(self.learned_gate) * self.attn2l(self.norm2l(x), context=context) + x
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
         return x
@@ -811,6 +817,7 @@ class ControlPWWLDM(ControlLDM):
     first_stage_key = 'image'
     cond_stage_key = 'all'
     control_key = 'cond_image'
+    padlimit = 1  #5
     
     # @torch.no_grad()
     # def get_input(self, batch, k, bs=None, *args, **kwargs):
@@ -856,7 +863,7 @@ class ControlPWWLDM(ControlLDM):
             # token_ids.masked_scatter_(token_ids_scatter_mask, flattokenids)
         # this is a non-parallelized implementation
         with torch.no_grad():
-            pad_token_id = self.cond_stage_model.tokenizer.pad_token_id
+            pad_token_id, bos_token_id, modelmaxlen = self.cond_stage_model.tokenizer.pad_token_id, self.cond_stage_model.tokenizer.bos_token_id, self.cond_stage_model.tokenizer.model_max_length 
             device = cond["caption"].device
             tokenids = cond["caption"].cpu()
             layerids = cond["layerids"].cpu()
@@ -876,6 +883,9 @@ class ControlPWWLDM(ControlLDM):
                             start_j = j+1
                 input_ids.append(tokenids[i, start_j:j+1])
             input_ids = pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id).to(device)
+            if input_ids.shape[1] < modelmaxlen:
+                pad_input_ids_block = torch.ones_like(input_ids[:, 0:1]) * pad_token_id
+                input_ids = torch.cat([input_ids, pad_input_ids_block.repeat(1, modelmaxlen - input_ids.shape[1])], 1)      # concatenate extra paddings to reach 77 length
              
             # 2. encode using text encoder
             text_emb = self.encode_using_text_encoder(input_ids)
@@ -903,8 +913,8 @@ class ControlPWWLDM(ControlLDM):
                 k += 1
             assert torch.all(tokenids == tokenids_recon)
             
-        global_prompt_mask = cond["captiontypes"] < 2
-        global_bos_eos_mask = cond["captiontypes"] == 0     # TODO: fix this (in dataset.py)
+        global_prompt_mask = (cond["captiontypes"] < 2) & (cond["captiontypes"] >= 0)
+        global_bos_eos_mask = ((cond["caption"] == pad_token_id) | (cond["caption"] == bos_token_id)) & global_prompt_mask
         
         ret = CustomTextConditioning(embs=out_emb,
                                      layer_ids=layerids,
@@ -917,6 +927,15 @@ class ControlPWWLDM(ControlLDM):
         cross_attn_masks = cond["regionmasks"]    
         cross_attn_masks = {res[0] * res[1]: mask.view(mask.size(0), mask.size(1), -1).transpose(1, 2) for res, mask in cross_attn_masks.items() if res[0] <= 64}
         ret.cross_attn_masks = cross_attn_masks
+        
+        if self.cas_name.startswith("legacy"):
+            ret.__class__ = CTC_gradio_pww
+            legacymethod= self.cas_name.split("+")[0][len("legacy-"):]
+            ret.set_method(legacymethod)
+            ret.threshold = self.threshold
+            ret.softness = self.softness
+            ret.strength = self.strength
+            
         return ret
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
@@ -925,7 +944,7 @@ class ControlPWWLDM(ControlLDM):
         
         # attach progress to cond["c_crossattn"]        # TODO: check that "t" is a tensor of one value per example in the batch
         cond["c_crossattn"][0].progress = 1 - t / self.num_timesteps
-        # cond["c_crossattn"][0].sigma_t = self.sigmas[t]
+        cond["c_crossattn"][0].sigma_t = self.sigmas[t].to(t.device)
 
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond, control=None, only_mid_control=self.only_mid_control)
@@ -992,14 +1011,14 @@ class ControlPWWLDM(ControlLDM):
     def get_uncond_batch(self, batch):      # DONE: change regionmasks to fit new prompts
         uncond_cond = deepcopy(batch)       # DONE: change all prompts to "" and re-tokenize
         bos, eos = self.cond_stage_model.tokenizer.bos_token_id, self.cond_stage_model.tokenizer.pad_token_id
-        maxlen = self.cond_stage_model.tokenizer.model_max_length
+        maxlen = (self.padlimit + 1) if self.limitpadding else self.cond_stage_model.tokenizer.model_max_length
         bs = batch["caption"].shape[0]
         device = batch["caption"].device
         
         new_caption3 = torch.ones(bs, maxlen, device=device, dtype=torch.long) * eos
+        new_caption3[:, 0] = bos
         new_layerids3 = torch.zeros_like(new_caption3)
         new_captiontypes3 = torch.zeros_like(new_caption3) + 1
-        new_caption3[:, 0] = bos
         new_caption3 = torch.cat([new_caption3, new_caption3], 1)
         new_layerids3 = torch.cat([new_layerids3, new_layerids3 + 1], 1)
         new_captiontypes3 = torch.cat([new_captiontypes3, new_captiontypes3 + 1], 1)
@@ -1124,68 +1143,75 @@ class ControlPWWLDM(ControlLDM):
         return log
     
 
-class ControlPWWLDMSimpleEncode(ControlPWWLDM):
+# class ControlPWWLDMSimpleEncode(ControlPWWLDM):
     
-    def get_learned_conditioning(self, cond):   return self.get_learned_conditioning_simple(cond)
+#     def get_learned_conditioning(self, cond):   return self.get_learned_conditioning_simple(cond)
     
-    def get_learned_conditioning_simple(self, cond):
-        # takes conditioning info (cond_key) and preprocesses it to later be fed into LDM
-        # returns CustomTextConditioning object
-        # called from get_input()
-        # must be used with cond_key = "all", then get_input() passes the batch as-is in here
-        # DONE: unpack texts, embed them, pack back up and package with cross-attention masks
+#     def get_learned_conditioning_simple(self, cond):
+#         # takes conditioning info (cond_key) and preprocesses it to later be fed into LDM
+#         # returns CustomTextConditioning object
+#         # called from get_input()
+#         # must be used with cond_key = "all", then get_input() passes the batch as-is in here
+#         # DONE: unpack texts, embed them, pack back up and package with cross-attention masks
         
-        # this is a non-parallelized implementation
-        with torch.no_grad():
-            tokenids = cond["caption"]
-            layerids = cond["layerids"]
+#         # this is a non-parallelized implementation
+#         with torch.no_grad():
+#             tokenids = cond["caption"]
+#             layerids = cond["layerids"]
              
-            # 2. encode using text encoder
-            outputs = self.cond_stage_model.transformer(input_ids=tokenids, output_hidden_states=self.cond_stage_model.layer=="hidden")
-            if self.cond_stage_model.layer == "last":
-                text_emb = outputs.last_hidden_state
-            elif self.cond_stage_model.layer == "pooled":
-                text_emb = outputs.pooler_output[:, None, :]
-            else:
-                text_emb = outputs.hidden_states[self.layer_idx]
+#             # 2. encode using text encoder
+#             outputs = self.cond_stage_model.transformer(input_ids=tokenids, output_hidden_states=self.cond_stage_model.layer=="hidden")
+#             if self.cond_stage_model.layer == "last":
+#                 text_emb = outputs.last_hidden_state
+#             elif self.cond_stage_model.layer == "pooled":
+#                 text_emb = outputs.pooler_output[:, None, :]
+#             else:
+#                 text_emb = outputs.hidden_states[self.layer_idx]
             
-        global_prompt_mask = cond["captiontypes"] < 2
-        global_bos_eos_mask = cond["captiontypes"] == 0
+#         global_prompt_mask = cond["captiontypes"] < 2
+#         global_bos_eos_mask = cond["captiontypes"] == 0
         
-        ret = CustomTextConditioning(embs=text_emb,
-                                     layer_ids=layerids,
-                                     token_ids=tokenids,
-                                     global_prompt_mask=global_prompt_mask,
-                                     global_bos_eos_mask=global_bos_eos_mask)
+#         ret = CustomTextConditioning(embs=text_emb,
+#                                      layer_ids=layerids,
+#                                      token_ids=tokenids,
+#                                      global_prompt_mask=global_prompt_mask,
+#                                      global_bos_eos_mask=global_bos_eos_mask)
         
-        ret.captiontypes = cond["captiontypes"]
+#         ret.captiontypes = cond["captiontypes"]
         
-        cross_attn_masks = cond["regionmasks"]    
-        cross_attn_masks = {res[0] * res[1]: mask.view(mask.size(0), mask.size(1), -1).transpose(1, 2) for res, mask in cross_attn_masks.items() if res[0] <= 64}
-        ret.cross_attn_masks = cross_attn_masks
-        return ret
+#         cross_attn_masks = cond["regionmasks"]    
+#         cross_attn_masks = {res[0] * res[1]: mask.view(mask.size(0), mask.size(1), -1).transpose(1, 2) for res, mask in cross_attn_masks.items() if res[0] <= 64}
+#         ret.cross_attn_masks = cross_attn_masks
+#         return ret
     
     
-def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simpleencode=False, threshold=-1):
+def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simpleencode=False, threshold=-1, strength=0., softness=0.):
     model.__class__ = ControlPWWLDM
-    if simpleencode:
-        model.__class__ = ControlPWWLDMSimpleEncode
+    # if simpleencode:
+    #     model.__class__ = ControlPWWLDMSimpleEncode
     model.first_stage_key = "image"
     model.control_key = "cond_image"
     model.cond_stage_key = "all"
+    model.cas_name = cas_name
+    model.threshold = threshold
+    model.strength = strength
+    model.softness = softness
     
     if cas_name is not None:
         assert cas_class is None
-        cas_class = {"both": CustomCrossAttentionBaselineBoth,
-                     "local": CustomCrossAttentionBaselineLocal,
-                     "global": CustomCrossAttentionBaselineGlobal,
-                     "bothext": CustomCrossAttentionExt,
-                     "bothext2": CustomCrossAttentionExt2,
-                     "bothminimal": CustomCrossAttentionMinimal,
-                     "doublecross": None,
-                     "sepswitch": CustomCrossAttentionSepSwitch,
-                     "delegated": CustomCrossAttentionDelegated,
-                     }[cas_name]
+        if cas_name.startswith("legacy"):
+            cas_class = CustomCrossAttentionLegacy
+        else:
+            cas_class = {"both": CustomCrossAttentionBaselineBoth,
+                        "local": CustomCrossAttentionBaselineLocal,
+                        "global": CustomCrossAttentionBaselineGlobal,
+                        "bothext": CustomCrossAttentionExt,
+                        "bothext2": CustomCrossAttentionExt2,
+                        "bothminimal": CustomCrossAttentionMinimal,
+                        "doublecross": None,
+                        "sepswitch": CustomCrossAttentionSepSwitch,
+                        "delegated": CustomCrossAttentionDelegated,
+                        }[cas_name]
         
     if cas_class is None:
         cas_class = CustomCrossAttentionBaseline
@@ -1204,7 +1230,6 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
                 module.attn2 = cas_class.from_base(module.attn2)
                 module.attn2.threshold = threshold
         
-            
     for module in model.control_model.modules():
         if isinstance(module, BasicTransformerBlock): # module.__class__.__name__ == "BasicTransformerBlock":
             assert not module.disable_self_attn
@@ -1239,7 +1264,8 @@ def get_checkpointing_callbacks(interval=6*60*60, dirpath=None):
 
 
 def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='control_v11p_sd15_seg', cas_name="bothext",
-                                freezedown=False, simpleencode=False, threshold=-1, loadckpt=""):
+                                freezedown=False, simpleencode=False, threshold=-1, strength=0., softness=0.,
+                                loadckpt=""):
     # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
     model = create_model(f'./models/{model_name}.yaml').cpu()
     # load main weights
@@ -1249,7 +1275,10 @@ def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='co
     model.base_model_name = basemodelname
     model.controlnet_model_name = model_name
     
-    model = convert_model(model, cas_name=cas_name, freezedown=freezedown, simpleencode=simpleencode, threshold=threshold)
+    model = convert_model(model, cas_name=cas_name, freezedown=freezedown, simpleencode=simpleencode, 
+                          threshold=threshold, strength=strength, softness=softness)
+    model.sigmas = ((1 - model.alphas_cumprod) / model.alphas_cumprod) ** 0.5
+    model.sigmas = torch.cat([torch.zeros_like(model.sigmas[0:1]), model.sigmas], 0)
     
     if loadckpt != "":
         print(f"loading trained parameters from {loadckpt}")
@@ -1350,10 +1379,11 @@ def main(batsize=5,
          version="v4",
          datadir="/USERSPACE/lukovdg1/coco2017/",
          devexamples="coco2017.4dev.examples.pkl,extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
-         cas="doublecross",  # "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
+         #  devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
+         cas="bothext", #"legacy-NewPosAttn+uselocal",  # "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
          devices=(0,),
          numtrain=-1,
-         regiondrop=0.,
+         regiondrop=-1.,
          controldrop=0.,
          forreal=False,
          seed=42,        # seed for training
@@ -1361,12 +1391,19 @@ def main(batsize=5,
          freezedown=False,      # don't adapt the down-sampling blocks of the Unet, only change and train the upsamling blocks
          freezecontrol=False,
          simpleencode=False,    # encode both global and all local prompts as one sequence
-        #  generate="alldev",   # ""
-        generate="",
-         threshold=0.2,
-         loadckpt="", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
+         generate="alldev",   # ""
+         # generate="",
+         generateonly=True,
+         threshold=0.6,
+         softness=0.5,
+         strength=5.0,
+         limitpadding=True,
+        #  loadckpt="",
+         loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/interval_delta_epoch=epoch=2_step=step=23145.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_bothext_v4_exp_12_forreal/interval_delta_epoch=epoch=2_step=step=22068.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/interval_delta_epoch=epoch=2_step=step=23145.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_bothext_v4_exp_5_forreal/interval_delta_epoch=epoch=2_step=step=23339.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_doublecross_v4_exp_2_forreal/latest_all_epoch=epoch=1_step=step=19541.ckpt",
+        #  loadckpt="", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
         #  loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/latest_all_epoch=epoch=9_step=step=100710.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
          ):  
+    mergeregions = True
     args = locals().copy()
     # print(args)
     print(json.dumps(args, indent=4))     
@@ -1381,8 +1418,8 @@ def main(batsize=5,
     learning_rate = 1e-5
     sd_locked = False
     
-    generate_set = "dev" if generate == "" else generate
-    generate = generate != ""
+    # generate_set = "dev" if generate == "" else generate
+    generate = generateonly #generate != ""
     
     numtrain = None if numtrain == -1 else numtrain
     
@@ -1409,29 +1446,34 @@ def main(batsize=5,
             loadedexamples_e = pkl.load(f)
             loadedexamples += loadedexamples_e
     # override pickled defaults
-    valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas, simpleencode=simpleencode)
+    valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas + "+test", simpleencode=simpleencode, 
+                                   mergeregions=mergeregions, limitpadding=limitpadding)
     valid_dl = COCODataLoader(valid_ds, batch_size=4, num_workers=4 if forreal else 0, shuffle=False)
     
     model = create_controlnet_pww_model(cas_name=cas, freezedown=freezedown, simpleencode=simpleencode, 
-                                        threshold=threshold, loadckpt=loadckpt)
+                                        threshold=threshold, strength=strength, softness=softness, 
+                                        loadckpt=loadckpt)
     model.set_control_drop(controldrop)
+    model.limitpadding = limitpadding
     
     seedswitch = SeedSwitch(seed, log_image_seed)
     image_logger = ImageLogger(batch_frequency=logger_freq, dl=valid_dl, seed=seedswitch)
+    
+    exppath.mkdir(parents=True, exist_ok=False)
+    print(f"logging in {exppath}")
+    with open(exppath / "args.json", "w") as f:
+        json.dump(args, f, indent=4)
     
     if generate:
         device = torch.device("cuda", devices[0])
         print("generation device", device)
         model = model.to(device)
             
-        exppath.mkdir(parents=True, exist_ok=False)
         image_logger.do_log_img(model, exppath / "image_log", split="gen")
-        
-    
     else:
         ds = COCOPanopticDataset(maindir=datadir, split="train" if forreal else "valid", casmode=cas, simpleencode=simpleencode, 
                         max_samples=numtrain if numtrain is not None else (None if forreal else 1000),
-                        regiondrop=regiondrop, mergeregions=True)
+                        regiondrop=regiondrop, mergeregions=mergeregions, limitpadding=limitpadding)
         
         print(len(ds))
         batsizes = {384: round(batch_size * 2.4), 448:round(batch_size * 1.4), 512: batch_size}
@@ -1527,10 +1569,14 @@ if __name__ == "__main__":
     
     # DONE: bothext2: variant that doesn't explicitly attach timestep info to query vectors
     
-    # TODO: implement "delegated" mode that automatically converts to gradio_pww-style conditioning object
-    # TODO: implement global-only prompt with annotation (add support for local marking on global prompt) --> delegated
+    # DONE: implement "delegated" mode that automatically converts to gradio_pww-style conditioning object
+    # DONE: implement global-only prompt with annotation (add support for local marking on global prompt) --> delegated
     
-    # TODO: check why we no longer get glitchy initial images with bothext
+    # DONE: check why we no longer get glitchy initial images with bothext
     # TODO: check sepswitch mode
     # DONE: check and rerun bothminimal and doublecross
+    
+    # DONE: implement training with minimal length first, and then with full length
+    # TODO: implement new ediffi(++) weight functions
+    # TODO: implement hybrid bothext + posattn
     
