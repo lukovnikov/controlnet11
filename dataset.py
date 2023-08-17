@@ -1021,45 +1021,6 @@ class COCOPanopticDataset(IterableDataset):
                 captions[i] = caption[:endidx]
                 layerids[i] = layerids[i][:endidx]
                 encoder_layerids[i] = encoder_layerids[i][:endidx]
-                    
-            
-        # if self.simpleencode:   # or self.casmode == "doublecross":
-        #     # DONE: concatenate into one sentence. Make sure layer ids are matching up!  # DONE: make sure max len is not exceeded
-        #     ret_caption, ret_layerid, ret_encoder_layerid = [], [], []
-        #     for i, (caption, layerid, encoder_layerid) in enumerate(zip(captions, layerids, encoder_layerids)):
-        #         if i == 0:      # global prompt: discard EOS
-        #             ret_caption.append(caption[0:-1])
-        #             ret_layerid.append(layerid[0:-1])
-        #             ret_encoder_layerid.append(encoder_layerid[0:-1])
-        #         else:     # region prompt: discard BOS and EOS
-        #             ret_caption.append(caption[1:-1])
-        #             ret_caption.append(comma)
-        #             ret_layerid.append(layerid[1:-1])
-        #             ret_layerid.append(torch.zeros_like(comma))
-        #             ret_encoder_layerid.append(encoder_layerid[1:-1])
-        #             ret_encoder_layerid.append(torch.zeros_like(comma))
-        #     # remove last comma
-        #     ret_caption.pop(-1)
-        #     ret_layerid.pop(-1)
-        #     ret_encoder_layerid.pop(-1)
-        #     # append EOS
-        #     ret_caption.append(caption[-1:])
-        #     ret_layerid.append(torch.zeros_like(layerid[-1:]))
-        #     ret_encoder_layerid.append(torch.zeros_like(encoder_layerid[-1:]))
-            
-        #     ret_captions, ret_layerids, ret_encoder_layerids = torch.cat(ret_caption, 0), torch.cat(ret_layerid, 0), torch.cat(ret_encoder_layerid, 0)
-        #     # make sure that length does not exceed maximum length
-        #     maxlen = self.tokenizer.model_max_length
-        #     if len(ret_captions) > maxlen:
-        #         ret_captions, ret_layerids, ret_encoder_layerids = ret_captions[:maxlen], ret_layerids[:maxlen], ret_encoder_layerids[:maxlen]
-        #         ret_captions[-1], ret_layerids[-1], ret_encoder_layerids[-1] = self.tokenizer.eos_token_id, 0, 0
-                
-        #     # if self.simpleencode:
-        #     assert self.casmode != "doublecross"
-        #     captions, layerids, encoder_layerids = [ret_captions], [ret_layerids], [ret_encoder_layerids]
-        #     # elif self.casmode == "doublecross":
-        #     #     captions[0], layerids[0], encoder_layerids[0] = ret_captions, (torch.zeros_like(ret_layerids)), (torch.zeros_like(ret_encoder_layerids))
-                
 
         # random square crop of size divisble by 64 and maximum size 512
         cropsize = min((min(imgtensor[0].shape) // 64) * 64, 512)

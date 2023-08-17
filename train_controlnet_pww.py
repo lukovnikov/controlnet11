@@ -883,9 +883,9 @@ class ControlPWWLDM(ControlLDM):
                             start_j = j+1
                 input_ids.append(tokenids[i, start_j:j+1])
             input_ids = pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id).to(device)
-            if input_ids.shape[1] < modelmaxlen:
-                pad_input_ids_block = torch.ones_like(input_ids[:, 0:1]) * pad_token_id
-                input_ids = torch.cat([input_ids, pad_input_ids_block.repeat(1, modelmaxlen - input_ids.shape[1])], 1)      # concatenate extra paddings to reach 77 length
+            # if input_ids.shape[1] < modelmaxlen:
+            #     pad_input_ids_block = torch.ones_like(input_ids[:, 0:1]) * pad_token_id
+            #     input_ids = torch.cat([input_ids, pad_input_ids_block.repeat(1, modelmaxlen - input_ids.shape[1])], 1)      # concatenate extra paddings to reach 77 length
              
             # 2. encode using text encoder
             text_emb = self.encode_using_text_encoder(input_ids)
@@ -1376,7 +1376,7 @@ def _debug_compare():
 
 
 def main(batsize=5,
-         version="v4",
+         version="v4.1",
          datadir="/USERSPACE/lukovdg1/coco2017/",
          devexamples="coco2017.4dev.examples.pkl,extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          #  devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
@@ -1386,24 +1386,24 @@ def main(batsize=5,
          regiondrop=-1.,
          controldrop=0.,
          forreal=False,
-         seed=42,        # seed for training
-         log_image_seed=41,     # seed for generating logging images
+         seed=12345,        # seed for training
+         log_image_seed=42,     # seed for generating logging images
          freezedown=False,      # don't adapt the down-sampling blocks of the Unet, only change and train the upsamling blocks
          freezecontrol=False,
          simpleencode=False,    # encode both global and all local prompts as one sequence
-         generate="alldev",   # ""
+        #  generate="alldev",   # ""
          # generate="",
-         generateonly=True,
+         generateonly=False,
          threshold=0.6,
          softness=0.5,
          strength=5.0,
-         limitpadding=True,
-        #  loadckpt="",
-         loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/interval_delta_epoch=epoch=2_step=step=23145.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_bothext_v4_exp_12_forreal/interval_delta_epoch=epoch=2_step=step=22068.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/interval_delta_epoch=epoch=2_step=step=23145.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_bothext_v4_exp_5_forreal/interval_delta_epoch=epoch=2_step=step=23339.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_doublecross_v4_exp_2_forreal/latest_all_epoch=epoch=1_step=step=19541.ckpt",
+         limitpadding=False,
+         loadckpt="",
+        #  loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/interval_delta_epoch=epoch=2_step=step=23145.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_bothext_v4_exp_12_forreal/interval_delta_epoch=epoch=2_step=step=22068.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/interval_delta_epoch=epoch=2_step=step=23145.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_bothext_v4_exp_5_forreal/interval_delta_epoch=epoch=2_step=step=23339.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_doublecross_v4_exp_2_forreal/latest_all_epoch=epoch=1_step=step=19541.ckpt",
         #  loadckpt="", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
         #  loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/latest_all_epoch=epoch=9_step=step=100710.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
          ):  
-    mergeregions = True
+    mergeregions = False
     args = locals().copy()
     # print(args)
     print(json.dumps(args, indent=4))     
@@ -1447,7 +1447,8 @@ def main(batsize=5,
             loadedexamples += loadedexamples_e
     # override pickled defaults
     valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas + "+test", simpleencode=simpleencode, 
-                                   mergeregions=mergeregions, limitpadding=limitpadding)
+                                   mergeregions=mergeregions, limitpadding=limitpadding, 
+                                   max_masks=28 if limitpadding else 10)
     valid_dl = COCODataLoader(valid_ds, batch_size=4, num_workers=4 if forreal else 0, shuffle=False)
     
     model = create_controlnet_pww_model(cas_name=cas, freezedown=freezedown, simpleencode=simpleencode, 
@@ -1473,6 +1474,7 @@ def main(batsize=5,
     else:
         ds = COCOPanopticDataset(maindir=datadir, split="train" if forreal else "valid", casmode=cas, simpleencode=simpleencode, 
                         max_samples=numtrain if numtrain is not None else (None if forreal else 1000),
+                        max_masks=28 if limitpadding else 10,
                         regiondrop=regiondrop, mergeregions=mergeregions, limitpadding=limitpadding)
         
         print(len(ds))
@@ -1540,8 +1542,6 @@ if __name__ == "__main__":
     # DONE: validation setup: take images of apples and oranges and of cats and dogs and change where the cats and dogs and apples and oranges are
     # DONE: use panoptic segmentation data from COCO instead
     
-    # TODO: evaluation setup --> RegionCLIP?
-    
     # COCO: Interesting test examples:
     # 152353, 577451, 326390, 265531, 494550  (oranges)      <-- round things
     # 289170, 513424, 415222 (apples)                        <-- round things
@@ -1556,7 +1556,6 @@ if __name__ == "__main__":
     
     # DONE: implement loading already trained models
     # DONE: port the rabbitfire and balls examples
-    # TODO: implement generation on entire dev set
     
     # DONE: use scheduled sampling in doublecross sampling using threshold
     
@@ -1577,6 +1576,9 @@ if __name__ == "__main__":
     # DONE: check and rerun bothminimal and doublecross
     
     # DONE: implement training with minimal length first, and then with full length
-    # TODO: implement new ediffi(++) weight functions
+    # DONE: implement new ediffi(++) weight functions
     # TODO: implement hybrid bothext + posattn
     
+    # TODO: generate evaluation dataset
+    # TODO: write evaluation code using CLIP
+    # TODO: implement generation on entire dev set to measure FID/KID
