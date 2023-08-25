@@ -39,7 +39,7 @@ class ImageLogger(Callback):
         self.log_first_step = log_first_step
         self.dl = dl    # dataloader instead of training batch
         self.seed = seed
-        self.batch_size = self.dl.batch_size
+        self.batch_size = self.dl.batch_size if self.dl is not None else -1
 
     @rank_zero_only
     def log_local(self, save_dir, split, images, global_step, current_epoch, batch_idx):
@@ -64,12 +64,15 @@ class ImageLogger(Callback):
         device = pl_module.device
         numgenerated = 0
         
+        allimages = []
+        
         for batch_idx, batch in enumerate(iter(self.dl)):
             batch = nested_to(batch, device)
 
             with torch.no_grad():
                 images = pl_module.log_images(batch, split=split, **self.log_images_kwargs)
-
+                allimages += images["all"].unbind(0)
+                
             for k in images:
                 N = images[k].shape[0]
                 numgenerated += N
@@ -87,6 +90,8 @@ class ImageLogger(Callback):
 
         if is_train:
             pl_module.train()
+            
+        return allimages
 
     def log_img(self, pl_module, global_step, split="train"):
         if isinstance(self.seed, SeedSwitch):

@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import timedelta
 import json
+import math
 import pickle as pkl
 from pathlib import Path
 import random
@@ -326,6 +327,181 @@ class CustomCrossAttentionSepSwitch(CustomCrossAttentionBaseline):
         return sim
     
     
+class CustomCrossAttentionCAC(CustomCrossAttentionBaseline):
+    
+    def forward(self, x, context=None, mask=None):
+        h = self.heads
+        
+        if context is not None:
+            context = context["c_crossattn"][0]
+            contextembs = context.embs
+        else:
+            assert False        # this shouldn't be used as self-attention
+            contextembs = x
+            
+        q = self.to_q(x)
+        k = self.to_k(contextembs)
+        v = self.to_v(contextembs)
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        # force cast to fp32 to avoid overflowing
+        if _ATTN_PRECISION =="fp32":
+            with torch.autocast(enabled=False, device_type = 'cuda'):
+                q, k = q.float(), k.float()
+                sim = einsum('b i d, b j d -> b i j', q, k)
+        else:
+            sim = einsum('b i d, b j d -> b i j', q, k)
+        
+        del q, k
+
+        if mask is not None:
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+
+        # attention
+        sim = (sim * self.scale).softmax(dim=-1)
+        
+        if context is not None:     # cross-attention
+            sim = self.cross_attention_control(sim, context, numheads=h)
+
+        out = einsum('b i j, b j d -> b i d', sim, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        return self.to_out(out)
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        # compute mask that ignores everything except the local descriptions
+        wf = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
+
+        # expand dimensions to match heads
+        wf = wf[:, None].repeat(1, numheads, 1, 1)
+        wf = wf.view(-1, wf.shape[-2], wf.shape[-1])
+        
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        wfmaxes = wf.max(-1, keepdim=True)[0]
+        wf = (wf >= (wfmaxes.clamp_min(1e-3) - 1e-4)).float()
+        
+        sim.masked_fill_(wf == 0, 0)
+        # sim = sim + wf
+        return sim
+    
+    
+class CustomCrossAttentionPosattn(CustomCrossAttentionBaseline):
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        # compute mask that ignores everything except the local descriptions
+        globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
+
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        maskmaxes = mask.max(-1, keepdim=True)[0]
+        mask = (mask >= (maskmaxes.clamp_min(1e-3) - 1e-4)).float()
+        
+        mask2 = (context.layer_ids[:, None] != 0).to(sim.dtype).to(sim.device)
+        # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
+        boostmask = mask * mask2        # selects only those tokens not belonging to any regional description
+        
+        # expand dimensions to match heads
+        mask = mask[:, None].repeat(1, numheads, 1, 1)
+        mask = mask.view(-1, mask.shape[-2], mask.shape[-1])
+        
+        a, b = max(0, context.threshold - context.softness / 2), min(context.threshold + context.softness / 2, 1)
+        weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
+        
+        boostmask = boostmask * weight
+        boostmask = boostmask[:, None].repeat(1, numheads, 1, 1)
+        boostmask = boostmask.view(-1, boostmask.shape[-2], boostmask.shape[-1])
+        
+        ret = sim + boostmask * context.strength * sim.std()
+        
+        # don't attend to other region-specific tokens or non-global prompt ones
+        ret.masked_fill_(mask == 0, max_neg_value)
+        
+        return ret
+    
+    
+class SimpleScheduleWeights(torch.nn.Module):
+    def __init__(self, numheads=8, numsteps=100):
+        super().__init__()
+        self.numheads = numheads
+        self.numsteps = numsteps
+        self.param = torch.nn.Parameter(torch.randn(self.numsteps, self.numheads) * 1e-3)
+        
+    def forward(self, progress):        # progress is float
+        # discretize to number of steps:
+        steps = torch.round(progress * self.numsteps).long().clamp(0, self.numsteps - 1)
+        headweights = torch.sigmoid(self.param[steps])      # initially, head weights are around 0.5, so halving the strength
+        return headweights
+    
+    
+class CustomCrossAttentionPosattnOptimized(CustomCrossAttentionBaseline):
+    def init_extra(self):
+        self.scheduleweights = SimpleScheduleWeights(numheads=self.heads)
+        for p in self.get_trainable_parameters():
+            p.train_param = True
+        
+    def get_trainable_parameters(self):
+        params = list(self.scheduleweights.parameters())
+        return params
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        # compute mask that ignores everything except the local descriptions
+        globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
+
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        maskmaxes = mask.max(-1, keepdim=True)[0]
+        mask = (mask >= (maskmaxes.clamp_min(1e-3) - 1e-4)).float()
+        
+        mask2 = (context.layer_ids[:, None] != 0).to(sim.dtype).to(sim.device)
+        # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
+        boostmask = mask * mask2        # selects only those tokens not belonging to any regional description
+        
+        # expand dimensions to match heads
+        mask = mask[:, None].repeat(1, numheads, 1, 1)
+        mask = mask.view(-1, mask.shape[-2], mask.shape[-1])
+        
+        a, b = max(0, context.threshold - context.softness / 2), min(context.threshold + context.softness / 2, 1)
+        weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
+    
+        headweights = self.scheduleweights(context.progress)
+        
+        boostmask = boostmask * weight
+        boostmask = boostmask[:, None].repeat(1, numheads, 1, 1)
+        boostmask = boostmask * headweights[None, :, None, None]
+        boostmask = boostmask.view(-1, boostmask.shape[-2], boostmask.shape[-1])
+        
+        ret = sim + boostmask * context.strength * sim.std()
+        
+        # don't attend to other region-specific tokens or non-global prompt ones
+        ret.masked_fill_(mask == 0, max_neg_value)
+        
+        return ret
+    
+    
+def _threshold_f(p, a, b=1): # transitions from 0 at p=a to 1 at p=b using sinusoid curve
+    threshold = (a, b)
+    b = max(threshold)
+    b = min(b, 1)
+    a = min(threshold)
+    a = min(b, a)
+    a = max(a, 0)
+    b = max(a, b)
+    
+    assert isinstance(p, torch.Tensor) and p.dim() == 1 and len(p) > 1
+    weight = torch.zeros_like(p)
+    weight.masked_fill_(p >= b, 1)
+    midpoint = (b - a) / 2 + a
+    midweight = (torch.sin(math.pi * (p - midpoint) / (b - a)) + 1) * 0.5
+    weight = torch.where((p < b) & (p > a), midweight, weight)
+    
+    return weight
+    
+    
 class CustomCrossAttentionBaselineGlobal(CustomCrossAttentionBaseline):
     
     def cross_attention_control(self, sim, context, numheads=None):
@@ -352,7 +528,7 @@ class DoublecrossBasicTransformerBlock(BasicTransformerBlock):
         self.attn2l.__class__ = CustomCrossAttentionBaselineLocalGlobalFallback
         
         self.register_buffer("manual_gate", torch.tensor([1.]))
-        self.learned_gate = torch.nn.Parameter(torch.tensor([0.]))      # TODO: per-head learned gate
+        self.learned_gate = torch.nn.Parameter(torch.randn(1,) * 1e-2)      # TODO: per-head learned gate
         
         self.norm2l = deepcopy(self.norm2)
         
@@ -922,6 +1098,10 @@ class ControlPWWLDM(ControlLDM):
                                      global_prompt_mask=global_prompt_mask,
                                      global_bos_eos_mask=global_bos_eos_mask)
         
+        ret.threshold = self.threshold
+        ret.softness = self.softness
+        ret.strength = self.strength
+        
         ret.captiontypes = cond["captiontypes"]
         
         cross_attn_masks = cond["regionmasks"]    
@@ -932,9 +1112,6 @@ class ControlPWWLDM(ControlLDM):
             ret.__class__ = CTC_gradio_pww
             legacymethod= self.cas_name.split("+")[0][len("legacy-"):]
             ret.set_method(legacymethod)
-            ret.threshold = self.threshold
-            ret.softness = self.softness
-            ret.strength = self.strength
             
         return ret
 
@@ -1019,9 +1196,10 @@ class ControlPWWLDM(ControlLDM):
         new_caption3[:, 0] = bos
         new_layerids3 = torch.zeros_like(new_caption3)
         new_captiontypes3 = torch.zeros_like(new_caption3) + 1
-        new_caption3 = torch.cat([new_caption3, new_caption3], 1)
-        new_layerids3 = torch.cat([new_layerids3, new_layerids3 + 1], 1)
-        new_captiontypes3 = torch.cat([new_captiontypes3, new_captiontypes3 + 1], 1)
+        if self.cas_name not in ("cac", "global", "posattn"):
+            new_caption3 = torch.cat([new_caption3, new_caption3], 1)
+            new_layerids3 = torch.cat([new_layerids3, new_layerids3 + 1], 1)
+            new_captiontypes3 = torch.cat([new_captiontypes3, new_captiontypes3 + 1], 1)
         new_captiontypes3[:, 0] = 0
         
         new_regionmasks3 = {k: torch.ones(bs, new_caption3.shape[1], v.shape[2], v.shape[3], device=v.device, dtype=v.dtype) 
@@ -1211,6 +1389,9 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
                         "doublecross": None,
                         "sepswitch": CustomCrossAttentionSepSwitch,
                         "delegated": CustomCrossAttentionDelegated,
+                        "cac": CustomCrossAttentionCAC,
+                        "posattn": CustomCrossAttentionPosattn,
+                        "posattn-opt": CustomCrossAttentionPosattnOptimized,
                         }[cas_name]
         
     if cas_class is None:
@@ -1378,9 +1559,9 @@ def _debug_compare():
 def main(batsize=5,
          version="v4.1",
          datadir="/USERSPACE/lukovdg1/coco2017/",
-         devexamples="coco2017.4dev.examples.pkl,extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
+         devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          #  devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
-         cas="bothext", #"legacy-NewPosAttn+uselocal",  # "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
+         cas="posattn-opt", #"legacy-NewPosAttn+uselocal",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
          devices=(0,),
          numtrain=-1,
          regiondrop=-1.,
@@ -1394,11 +1575,12 @@ def main(batsize=5,
         #  generate="alldev",   # ""
          # generate="",
          generateonly=False,
-         threshold=0.6,
-         softness=0.5,
-         strength=5.0,
+         threshold=0.3,
+         softness=0.4,
+         strength=10,
          limitpadding=False,
          loadckpt="",
+        #  loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_bothext2_v4.1_exp_2_forreal/latest_all_epoch=epoch=3_step=step=21369.ckpt",
         #  loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/interval_delta_epoch=epoch=2_step=step=23145.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_bothext_v4_exp_12_forreal/interval_delta_epoch=epoch=2_step=step=22068.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/interval_delta_epoch=epoch=2_step=step=23145.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_bothext_v4_exp_5_forreal/interval_delta_epoch=epoch=2_step=step=23339.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_doublecross_v4_exp_2_forreal/latest_all_epoch=epoch=1_step=step=19541.ckpt",
         #  loadckpt="", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
         #  loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/latest_all_epoch=epoch=9_step=step=100710.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
@@ -1470,7 +1652,9 @@ def main(batsize=5,
         print("generation device", device)
         model = model.to(device)
             
-        image_logger.do_log_img(model, exppath / "image_log", split="gen")
+        allimages = image_logger.do_log_img(model, exppath / "image_log", split="gen")
+        # convert them to 
+        
     else:
         ds = COCOPanopticDataset(maindir=datadir, split="train" if forreal else "valid", casmode=cas, simpleencode=simpleencode, 
                         max_samples=numtrain if numtrain is not None else (None if forreal else 1000),
@@ -1577,6 +1761,7 @@ if __name__ == "__main__":
     
     # DONE: implement training with minimal length first, and then with full length
     # DONE: implement new ediffi(++) weight functions
+    # TODO: implement CAC exactly for comparison
     # TODO: implement hybrid bothext + posattn
     
     # TODO: generate evaluation dataset

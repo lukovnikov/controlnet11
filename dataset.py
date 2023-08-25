@@ -93,7 +93,7 @@ class COCODatasetSubset(Dataset):
         return self.mainds.materialize_example(self.examples[index])
         
 
-class  COCODataset(IterableDataset):
+class COCODataset(IterableDataset):
     def __init__(self, split="valid", maxmasks=20, max_samples=None, shuffle=False, min_size=350,
                  captionpath="/USERSPACE/lukovdg1/controlnet11/coco/annotations/", cas=None, simpleencode=False,
                  tokenizer_version="openai/clip-vit-large-patch14", filterids=None, dataset_name=None):
@@ -593,7 +593,7 @@ class COCOPanopticDataset(IterableDataset):
         self.casmode = self.casmodechunks[0]
         self.simpleencode = simpleencode
         
-        self.use_local = "uselocal" in self.casmodechunks
+        self.use_local = ("uselocal" in self.casmodechunks) or (self.casmode in ("cac", "posattn"))       # use local annotations on global prompt and discard local prompts
         
         self.mergeregions = mergeregions
         self.limitpadding = limitpadding
@@ -829,7 +829,9 @@ class COCOPanopticDataset(IterableDataset):
         
     # def __getitem__(self, item):
     #     example = self.examples[item]
+    
         return self.materialize_example(example)
+        # return example
     
     def __len__(self):
         return sum([len(v) for k, v in self.examples])
@@ -971,20 +973,20 @@ class COCOPanopticDataset(IterableDataset):
             cond_imgtensor = torch.where(region_mask.unsqueeze(0) > 0.5, maskcolor, cond_imgtensor)
             
         # append extra global prompt
-        if self.casmode == "doublecross" and not ("keepprompt" in self.casmodechunks or "test" in self.casmodechunks):
+        extraexpressions = ["This image contains", "In this image are", "In this picture are", "This picture contains"]
+        if (self.casmode == "doublecross") and not ("keepprompt" in self.casmodechunks or "test" in self.casmodechunks):
             assert not self.simpleencode
-            extraexpressions = ["This image contains", "In this image are", "In this picture are", "This picture contains"]
             captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join([e for e in captions[1:]]) + "."
             
         minimize_length = False
-        if self.simpleencode:   # or self.casmode == "doublecross":
+        if self.simpleencode or (self.casmode == "posattn-opt" and not ("keepprompt" in self.casmodechunks or "test" in self.casmodechunks)):   # or self.casmode == "doublecross":
             tojoin = []
             for i, capt in enumerate(captions[1:]):
                 tojoin.append(f"{{{capt}:{i}}}")
             captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join(tojoin) + "."
             
-            captions, layerids = _tokenize_annotated_prompt(captions[0], tokenizer=self.tokenizer, minimize_length=minimize_length)
-            captions, layerids = [captions], [layerids]
+            _captions, _layerids = _tokenize_annotated_prompt(captions[0], tokenizer=self.tokenizer, minimize_length=minimize_length)
+            captions, layerids = [_captions], [_layerids]
             encoder_layerids = [torch.ones_like(layerids[-1]) * 0]
         else:
             # encode separately
@@ -1008,7 +1010,7 @@ class COCOPanopticDataset(IterableDataset):
             if not self.use_local:
                 layerids[0] = encoder_layerids[0]
             else:
-                # retain only first ones
+                # retain only global caption
                 captions = [captions[0]]
                 layerids = [layerids[0]]
                 encoder_layerids = [encoder_layerids[0]]
@@ -1065,19 +1067,27 @@ class COCOPanopticDataset(IterableDataset):
     
     
 class COCODataLoader(object):
-    def __init__(self, cocodataset:COCODataset, batch_size=2, shuffle=False, num_workers=0) -> None:
+    def __init__(self, cocodataset:COCODataset, batch_size=2, shuffle=False, num_workers=0, repeatexample=False) -> None:
         super().__init__()
         self.ds = cocodataset
         self.dataloaders = []
         self.batch_size = min(batch_size.values()) if isinstance(batch_size, dict) else batch_size
+        self.repeatexample = repeatexample
+            
         for k, cocosubset in self.ds.examples:
             if isinstance(batch_size, dict):
                 batsize = batch_size[k]
             else:
                 batsize = batch_size
+                
+            collatefn = cocodataset.collate_fn
+            if self.repeatexample:
+                collatefn = lambda examples: cocodataset.collate_fn(examples * batch_size)
+                batsize = 1
+                
             subdl = DataLoader(COCODatasetSubset(cocosubset, self.ds), 
                                        batch_size=batsize, 
-                                       collate_fn=cocodataset.collate_fn, 
+                                       collate_fn=collatefn, 
                                        shuffle=shuffle,
                                        num_workers=num_workers)
             self.dataloaders.append(subdl)
