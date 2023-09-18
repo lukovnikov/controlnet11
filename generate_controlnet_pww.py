@@ -65,12 +65,15 @@ def do_log_img(imagelogger, batch, pl_module):
 
 
 def main(
-    expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn_v4.1_exp_3",
+    expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn2_v4.1_exp_21",
+        # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn_v4.1_exp_1",
+        # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn_v4.1_exp_3",
         #  expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_global_v4.1_exp_2/",
         #   expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_bothext2_v4.1_exp_2_forreal/",
          loadckpt="latest*.ckpt",
          numgen=4,
-         examples="threeballs.variants.pkl", #"coco2017.4dev.examples.pkl,extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
+         examples="extradev.examples.pkl",
+        #  examples="threeballs.variants.pkl", #"coco2017.4dev.examples.pkl,extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          devices=(3,),
          seed=123456,
          threshold=-1.,

@@ -387,6 +387,53 @@ class CustomCrossAttentionCAC(CustomCrossAttentionBaseline):
         # sim = sim + wf
         return sim
     
+
+class CustomCrossAttentionDenseDiffusion(CustomCrossAttentionBaseline):
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        # compute mask that ignores everything except the local descriptions
+        globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
+
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        maskmaxes = mask.max(-1, keepdim=True)[0]
+        mask = (mask >= (maskmaxes.clamp_min(1e-3) - 1e-4)).float()
+        
+        mask2 = (context.layer_ids[:, None] != 0).to(sim.dtype).to(sim.device)
+        # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
+        boostmask = mask * mask2        # selects only those tokens belonging to regional description corresponding to the region pixels
+        # R is boostmask
+        mpos = sim.max(-1, keepdims=True)[0] - sim
+        mneg = sim - sim.min(-1, keepdims=True)[0]
+        lambda_t = (1 - context.progress) ** 5
+        lambda_t.masked_fill_(context.progress > 0.3, 0)
+        
+        boostmask = boostmask[:, None].repeat(1, numheads, 1, 1)
+        boostmask = boostmask.view(-1, boostmask.shape[-2], boostmask.shape[-1])
+        lambda_t = lambda_t[:, None].repeat(1, numheads)
+        lambda_t = lambda_t.view(-1)
+        
+        # effect of region size (S in paper equations)
+        S = boostmask.sum(1, keepdims=True) / boostmask.shape[1]
+
+        ret = sim + context.strength * lambda_t[:, None, None] * boostmask * mpos * (1 - S) - context.strength * lambda_t[:, None, None] * (1 - boostmask) * mneg * (1 - S)
+        
+        # # expand dimensions to match heads
+        # mask = mask[:, None].repeat(1, numheads, 1, 1)
+        # mask = mask.view(-1, mask.shape[-2], mask.shape[-1])
+        
+        # a, b = max(0, context.threshold - context.softness / 2), min(context.threshold + context.softness / 2, 1)
+        # weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
+        
+        
+        # ret = sim + boostmask * context.strength * sim.std()
+        
+        # # don't attend to other region-specific tokens or non-global prompt ones
+        # ret.masked_fill_(mask == 0, max_neg_value)
+        
+        return ret
+    
     
 class CustomCrossAttentionPosattn(CustomCrossAttentionBaseline):
     
@@ -421,6 +468,137 @@ class CustomCrossAttentionPosattn(CustomCrossAttentionBaseline):
         ret.masked_fill_(mask == 0, max_neg_value)
         
         return ret
+    
+    
+class CustomCrossAttentionPosattn2(CustomCrossAttentionBaseline):
+    
+    def forward(self, x, context=None, mask=None):
+        h = self.heads
+        
+        if context is not None:
+            context = context["c_crossattn"][0]
+            contextembs = context.embs
+        else:
+            assert False        # this shouldn't be used as self-attention
+            contextembs = x
+            
+        q = self.to_q(x)
+        k = self.to_k(contextembs)
+        v = self.to_v(contextembs)
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        # force cast to fp32 to avoid overflowing
+        if _ATTN_PRECISION =="fp32":
+            with torch.autocast(enabled=False, device_type = 'cuda'):
+                q, k = q.float(), k.float()
+                sim = einsum('b i d, b j d -> b i j', q, k)
+        else:
+            sim = einsum('b i d, b j d -> b i j', q, k)
+        
+        del q, k
+
+        if mask is not None:
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+
+        if context is not None:     # cross-attention
+            sim = self.cross_attention_control(sim, context, numheads=h)
+        
+        # attention
+        # sim = (sim * self.scale).softmax(dim=-1)
+
+        out = einsum('b i j, b j d -> b i d', sim, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        return self.to_out(out)
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        # compute mask that ignores everything except the local descriptions
+        globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
+        assert torch.all(globalmask == 1)
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
+
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        maskmaxes = mask.max(-1, keepdim=True)[0]
+        mask = (mask >= (maskmaxes.clamp_min(1e-3) - 1e-4)).float()
+        maskext = mask[:, None].repeat(1, numheads, 1, 1)
+        maskext = maskext.view(-1, maskext.shape[-2], maskext.shape[-1])
+        
+        mask2 = (context.layer_ids[:, None] != 0).to(sim.dtype).to(sim.device)
+        mask2ext = mask2[:, None].repeat(1, numheads, 1, 1)
+        mask2ext = mask2ext.view(-1, mask2ext.shape[-2], mask2ext.shape[-1])
+        
+        # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
+        boostmask = mask * mask2        # selects only those tokens not belonging to any regional description
+        a, b = max(0, context.threshold - context.softness / 2), min(context.threshold + context.softness / 2, 1)
+        weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
+        boostmask = boostmask * weight
+        boostmaskext = boostmask[:, None].repeat(1, numheads, 1, 1)
+        boostmaskext = boostmaskext.view(-1, boostmaskext.shape[-2], boostmaskext.shape[-1])
+        
+        sim = sim + boostmaskext * context.strength * sim.std()
+        
+        # do mixture of two distributions: one over region tokens, and one over non-region tokens
+        sim = sim * self.scale
+        probs_vanilla = sim.softmax(-1)
+        prob_mass_of_regions = (probs_vanilla * mask2ext).sum(-1, keepdims=True)
+        
+        probs_inside_regions = sim.masked_fill(maskext * mask2ext == 0, max_neg_value).softmax(-1)
+        probs_outside_regions = sim.masked_fill(mask2ext == 1, max_neg_value).softmax(-1)
+        
+        outprobs = prob_mass_of_regions * probs_inside_regions + (1 - prob_mass_of_regions) * probs_outside_regions
+        
+        return outprobs
+    
+    
+    
+class CustomCrossAttentionPosattn3(CustomCrossAttentionPosattn2):
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        # compute mask that ignores everything except the local descriptions
+        globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
+        assert torch.all(globalmask == 1)
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
+
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        maskmaxes = mask.max(-1, keepdim=True)[0]
+        mask = (mask >= (maskmaxes.clamp_min(1e-3) - 1e-4)).float()
+        maskext = mask[:, None].repeat(1, numheads, 1, 1)
+        maskext = maskext.view(-1, maskext.shape[-2], maskext.shape[-1])
+        
+        mask2 = (context.layer_ids[:, None] != 0).to(sim.dtype).to(sim.device)
+        mask2ext = mask2[:, None].repeat(1, numheads, 1, 1)
+        mask2ext = mask2ext.view(-1, mask2ext.shape[-2], mask2ext.shape[-1])
+        
+        # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
+        boostmask = mask * mask2        # selects only those tokens not belonging to any regional description
+        a, b = max(0, context.threshold - context.softness / 2), min(context.threshold + context.softness / 2, 1)
+        weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
+        boostmask = boostmask * weight
+        boostmaskext = boostmask[:, None].repeat(1, numheads, 1, 1)
+        boostmaskext = boostmaskext.view(-1, boostmaskext.shape[-2], boostmaskext.shape[-1])
+        
+        mpos = sim.max(-1, keepdims=True)[0] - sim
+        # mneg = sim - sim.min(-1, keepdims=True)[0]
+        S = boostmaskext.sum(1, keepdims=True) / boostmaskext.shape[1]
+        
+        sim = sim + boostmaskext * context.strength * mpos * (1 - S)
+        
+        # do mixture of two distributions: one over region tokens, and one over non-region tokens
+        sim = sim * self.scale
+        probs_vanilla = sim.softmax(-1)
+        prob_mass_of_regions = (probs_vanilla * mask2ext).sum(-1, keepdims=True)
+        
+        probs_inside_regions = sim.masked_fill(maskext * mask2ext == 0, max_neg_value).softmax(-1)
+        probs_outside_regions = sim.masked_fill(mask2ext == 1, max_neg_value).softmax(-1)
+        
+        outprobs = prob_mass_of_regions * probs_inside_regions + (1 - prob_mass_of_regions) * probs_outside_regions
+        
+        return outprobs
     
     
 class SimpleScheduleWeights(torch.nn.Module):
@@ -461,10 +639,6 @@ class CustomCrossAttentionPosattnOptimized(CustomCrossAttentionBaseline):
         # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
         boostmask = mask * mask2        # selects only those tokens not belonging to any regional description
         
-        # expand dimensions to match heads
-        mask = mask[:, None].repeat(1, numheads, 1, 1)
-        mask = mask.view(-1, mask.shape[-2], mask.shape[-1])
-        
         a, b = max(0, context.threshold - context.softness / 2), min(context.threshold + context.softness / 2, 1)
         weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
     
@@ -472,15 +646,65 @@ class CustomCrossAttentionPosattnOptimized(CustomCrossAttentionBaseline):
         
         boostmask = boostmask * weight
         boostmask = boostmask[:, None].repeat(1, numheads, 1, 1)
-        boostmask = boostmask * headweights[None, :, None, None]
+        boostmask = boostmask * headweights[:, :, None, None]
         boostmask = boostmask.view(-1, boostmask.shape[-2], boostmask.shape[-1])
         
         ret = sim + boostmask * context.strength * sim.std()
         
         # don't attend to other region-specific tokens or non-global prompt ones
+        # expand dimensions to match heads
+        mask = mask[:, None].repeat(1, numheads, 1, 1)
+        mask = mask.view(-1, mask.shape[-2], mask.shape[-1])
         ret.masked_fill_(mask == 0, max_neg_value)
         
         return ret
+    
+    
+class CustomCrossAttentionPosattn2Optimized(CustomCrossAttentionPosattnOptimized, CustomCrossAttentionPosattn2):
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        # compute mask that ignores everything except the local descriptions
+        globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
+        assert torch.all(globalmask == 1)
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
+
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        maskmaxes = mask.max(-1, keepdim=True)[0]
+        mask = (mask >= (maskmaxes.clamp_min(1e-3) - 1e-4)).float()
+        maskext = mask[:, None].repeat(1, numheads, 1, 1)
+        maskext = maskext.view(-1, maskext.shape[-2], maskext.shape[-1])
+        
+        mask2 = (context.layer_ids[:, None] != 0).to(sim.dtype).to(sim.device)
+        mask2ext = mask2[:, None].repeat(1, numheads, 1, 1)
+        mask2ext = mask2ext.view(-1, mask2ext.shape[-2], mask2ext.shape[-1])
+        
+        
+        # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
+        boostmask = mask * mask2        # selects only those tokens not belonging to any regional description
+        a, b = max(0, context.threshold - context.softness / 2), min(context.threshold + context.softness / 2, 1)
+        weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
+        boostmask = boostmask * weight
+        boostmaskext = boostmask[:, None].repeat(1, numheads, 1, 1)
+        
+        headweights = self.scheduleweights(context.progress)
+        boostmaskext = boostmaskext * headweights[:, :, None, None]
+        
+        boostmaskext = boostmaskext.view(-1, boostmaskext.shape[-2], boostmaskext.shape[-1])
+        
+        sim = sim + boostmaskext * context.strength * sim.std()
+        
+        # do mixture of two distributions: one over region tokens, and one over non-region tokens
+        sim = sim * self.scale
+        probs_vanilla = sim.softmax(-1)
+        prob_mass_of_regions = (probs_vanilla * mask2ext).sum(-1, keepdims=True)
+        
+        probs_inside_regions = sim.masked_fill(maskext * mask2ext == 0, max_neg_value).softmax(-1)
+        probs_outside_regions = sim.masked_fill(mask2ext == 1, max_neg_value).softmax(-1)
+        
+        outprobs = prob_mass_of_regions * probs_inside_regions + (1 - prob_mass_of_regions) * probs_outside_regions
+        
+        return outprobs
     
     
 def _threshold_f(p, a, b=1): # transitions from 0 at p=a to 1 at p=b using sinusoid curve
@@ -492,7 +716,10 @@ def _threshold_f(p, a, b=1): # transitions from 0 at p=a to 1 at p=b using sinus
     a = max(a, 0)
     b = max(a, b)
     
-    assert isinstance(p, torch.Tensor) and p.dim() == 1 and len(p) > 1
+    if not isinstance(p, torch.Tensor) and p.dim() == 1 and len(p) > 1:
+        print("Assertion failed")
+        print(p)
+        assert False
     weight = torch.zeros_like(p)
     weight.masked_fill_(p >= b, 1)
     midpoint = (b - a) / 2 + a
@@ -1196,7 +1423,7 @@ class ControlPWWLDM(ControlLDM):
         new_caption3[:, 0] = bos
         new_layerids3 = torch.zeros_like(new_caption3)
         new_captiontypes3 = torch.zeros_like(new_caption3) + 1
-        if self.cas_name not in ("cac", "global", "posattn"):
+        if self.cas_name not in ("cac", "global", "dd") and not self.cas_name.startswith("posattn"):
             new_caption3 = torch.cat([new_caption3, new_caption3], 1)
             new_layerids3 = torch.cat([new_layerids3, new_layerids3 + 1], 1)
             new_captiontypes3 = torch.cat([new_captiontypes3, new_captiontypes3 + 1], 1)
@@ -1390,8 +1617,12 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
                         "sepswitch": CustomCrossAttentionSepSwitch,
                         "delegated": CustomCrossAttentionDelegated,
                         "cac": CustomCrossAttentionCAC,
+                        "dd": CustomCrossAttentionDenseDiffusion,
                         "posattn": CustomCrossAttentionPosattn,
+                        "posattn2": CustomCrossAttentionPosattn2,
+                        "posattn3": CustomCrossAttentionPosattn3,
                         "posattn-opt": CustomCrossAttentionPosattnOptimized,
+                        "posattn2-opt": CustomCrossAttentionPosattn2Optimized,
                         }[cas_name]
         
     if cas_class is None:
@@ -1561,8 +1792,8 @@ def main(batsize=5,
          datadir="/USERSPACE/lukovdg1/coco2017/",
          devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          #  devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
-         cas="posattn-opt", #"legacy-NewPosAttn+uselocal",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
-         devices=(0,),
+         cas="posattn2", #"posattn2-opt", #"legacy-NewPosAttn+uselocal",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
+         devices=(1,),
          numtrain=-1,
          regiondrop=-1.,
          controldrop=0.,
@@ -1574,10 +1805,10 @@ def main(batsize=5,
          simpleencode=False,    # encode both global and all local prompts as one sequence
         #  generate="alldev",   # ""
          # generate="",
-         generateonly=False,
+         generateonly=True,
          threshold=0.3,
-         softness=0.4,
-         strength=10,
+         softness=0.1,
+         strength=1.5,
          limitpadding=False,
          loadckpt="",
         #  loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_bothext2_v4.1_exp_2_forreal/latest_all_epoch=epoch=3_step=step=21369.ckpt",
@@ -1767,3 +1998,11 @@ if __name__ == "__main__":
     # TODO: generate evaluation dataset
     # TODO: write evaluation code using CLIP
     # TODO: implement generation on entire dev set to measure FID/KID
+    
+    # TODO: supersimple posattn with annotated global only
+    
+    # TODO: posattn but pile the probability mass that was on the non-relevant regions onto the relevant region!
+    # why:  - if random z has higher affinity to assign objects incorrectly, current negattn approach puts
+    #         most probability mass into most probable class (BOS?)
+    
+    # TODO: dense diffusion approach    

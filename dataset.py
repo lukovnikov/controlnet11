@@ -13,8 +13,42 @@ import itertools
 import numpy as np
 import colorsys
 from einops import rearrange, repeat
+import re
 
-from gradio_pww import _tokenize_annotated_prompt
+
+def _tokenize_annotated_prompt(prompt, tokenizer, minimize_length=False):
+    prompt = re.split(r"(\{[^\}]+\})", prompt)
+    _prompt = []
+    _layer_id = []
+    for e in prompt:
+        m = re.match(r"\{(.+):(\d+)\}", e)
+        if m:
+            _prompt.append(m.group(1))
+            _layer_id.append(int(m.group(2)) + 1)
+        else:
+            _prompt.append(e)
+            _layer_id.append(0)
+
+    for i in range(len(_prompt)):
+        if i == len(_prompt) - 1:
+            tokenized = tokenizer([_prompt[i]],
+                                  padding="max_length" if not minimize_length else "do_not_pad",
+                                  max_length=tokenizer.model_max_length,
+                                  return_overflowing_tokens=False,
+                                  truncation=True,
+                                  return_tensors="pt")
+        else:
+            tokenized = tokenizer([_prompt[i]], return_tensors="pt")
+        _prompt[i] = tokenized.input_ids[0, (0 if i == 0 else 1):(-1 if i < len(_prompt) - 1 else None)]
+        _layer_id[i] = torch.tensor([_layer_id[i]]).repeat(len(_prompt[i]))
+
+    token_ids = torch.cat(_prompt, 0)
+    token_ids = token_ids[:min(len(token_ids), tokenizer.model_max_length)]
+    layer_ids = torch.cat(_layer_id, 0)
+    layer_ids = layer_ids[:min(len(layer_ids), tokenizer.model_max_length)]
+
+    assert len(token_ids) <= tokenizer.model_max_length
+    return token_ids, layer_ids
 
 
 class ProcessedCOCOExample(object):
@@ -593,7 +627,7 @@ class COCOPanopticDataset(IterableDataset):
         self.casmode = self.casmodechunks[0]
         self.simpleencode = simpleencode
         
-        self.use_local = ("uselocal" in self.casmodechunks) or (self.casmode in ("cac", "posattn"))       # use local annotations on global prompt and discard local prompts
+        self.use_local = ("uselocal" in self.casmodechunks) or (self.casmode in ("cac", "posattn", "posattn2", "posattn3", "dd"))       # use local annotations on global prompt and discard local prompts
         
         self.mergeregions = mergeregions
         self.limitpadding = limitpadding
@@ -978,8 +1012,27 @@ class COCOPanopticDataset(IterableDataset):
             assert not self.simpleencode
             captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join([e for e in captions[1:]]) + "."
             
+            
+            
         minimize_length = False
-        if self.simpleencode or (self.casmode == "posattn-opt" and not ("keepprompt" in self.casmodechunks or "test" in self.casmodechunks)):   # or self.casmode == "doublecross":
+        
+        if self.casmode in ("posattn-opt", "posattn2-opt"):
+            caption = captions[0]
+            augment_caption = not ("keepprompt" in self.casmodechunks or "test" in self.casmodechunks)
+            if augment_caption:       # if training, automatically augment sentences
+                tojoin = []
+                for i, capt in enumerate(captions[1:]):
+                    tojoin.append(f"{{{capt}:{i}}}")
+                caption += " " + random.choice(extraexpressions) + " " + ", ".join(tojoin) + "."
+            else:
+                caption = caption
+            _caption, _layerids = _tokenize_annotated_prompt(caption, tokenizer=self.tokenizer, minimize_length=minimize_length)
+            # replace region codes with layer ids
+            for region_code, layerid in region_code_to_layerid.items():
+                _layerids = torch.masked_fill(_layerids, _layerids == region_code + 1, layerid)
+            captions, layerids = [_caption], [_layerids]
+            encoder_layerids = [torch.ones_like(layerids[-1]) * 0]
+        elif self.simpleencode: #  or (self.casmode in ("posattn-opt", "posattn2-opt") and not ("keepprompt" in self.casmodechunks or "test" in self.casmodechunks)):   # or self.casmode == "doublecross":
             tojoin = []
             for i, capt in enumerate(captions[1:]):
                 tojoin.append(f"{{{capt}:{i}}}")
