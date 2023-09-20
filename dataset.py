@@ -613,7 +613,7 @@ class COCOPanopticDataset(IterableDataset):
     
     def __init__(self, maindir:str=None, split="valid", max_masks=10, min_masks=2, max_samples=None, min_size=350,
                  examples=None, mergeregions=True, 
-                 regiondrop=True,           # if False, dropping examples with too many masks, if True: keeping all examples and dropping randomly some masks, if float: acts like True, but also drops some masks with the given number as drop probability
+                 regiondrop=False,           # if False, dropping examples with too many masks, if True: keeping all examples and dropping randomly some masks, if float: acts like True, but also drops some masks with the given number as drop probability
                  casmode=None, simpleencode=False, limitpadding=False,
                  tokenizer_version="openai/clip-vit-large-patch14"):
         super().__init__()
@@ -623,12 +623,9 @@ class COCOPanopticDataset(IterableDataset):
         self.tokenizer_version = tokenizer_version
         self.load_tokenizer()
         
-        self.casmodechunks = casmode.split("+")
-        self.casmode = self.casmodechunks[0]
+        self.casmode = casmode
+        
         self.simpleencode = simpleencode
-        
-        self.use_local = ("uselocal" in self.casmodechunks) or (self.casmode in ("cac", "posattn", "posattn2", "posattn3", "dd"))       # use local annotations on global prompt and discard local prompts
-        
         self.mergeregions = mergeregions
         self.limitpadding = limitpadding
         
@@ -986,7 +983,7 @@ class COCOPanopticDataset(IterableDataset):
         for i, (region_code, region_info) in enumerate(example.seg_info.items()):
             rgb = torch.tensor(region_code_to_rgb(region_code))
             region_mask = (seg_imgtensor == rgb[:, None, None]).all(0)
-            if self.casmode != "global":
+            if self.casmode.name != "global":
                 region_caption = region_info["caption"]
                 if region_caption in unique_region_captions:
                     if (not self.mergeregions) or (region_caption not in region_caption_to_layerid):
@@ -1008,45 +1005,45 @@ class COCOPanopticDataset(IterableDataset):
             
         # append extra global prompt
         extraexpressions = ["This image contains", "In this image are", "In this picture are", "This picture contains"]
-        if (self.casmode == "doublecross") and not ("keepprompt" in self.casmodechunks or "test" in self.casmodechunks):
-            assert not self.simpleencode
-            captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join([e for e in captions[1:]]) + "."
-            
+        # if (self.casmode.name == "doublecross") and not ("keepprompt" in self.casmode.chunks or "test" in self.casmode.chunks):
+        #     # assert not self.simpleencode
+        #     captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join([e for e in captions[1:]]) + "."
             
             
         minimize_length = False
         
-        if self.casmode in ("posattn-opt", "posattn2-opt"):
+        if self.casmode.use_global_prompt_only:   # self.casmode in ("posattn-opt", "posattn2-opt"):
             caption = captions[0]
-            augment_caption = not ("keepprompt" in self.casmodechunks or "test" in self.casmodechunks)
-            if augment_caption:       # if training, automatically augment sentences
+            if self.casmode.augment_global_caption:       # if training, automatically augment sentences
                 tojoin = []
                 for i, capt in enumerate(captions[1:]):
                     tojoin.append(f"{{{capt}:{i}}}")
                 caption += " " + random.choice(extraexpressions) + " " + ", ".join(tojoin) + "."
-            else:
-                caption = caption
             _caption, _layerids = _tokenize_annotated_prompt(caption, tokenizer=self.tokenizer, minimize_length=minimize_length)
             # replace region codes with layer ids
             for region_code, layerid in region_code_to_layerid.items():
                 _layerids = torch.masked_fill(_layerids, _layerids == region_code + 1, layerid)
             captions, layerids = [_caption], [_layerids]
             encoder_layerids = [torch.ones_like(layerids[-1]) * 0]
-        elif self.simpleencode: #  or (self.casmode in ("posattn-opt", "posattn2-opt") and not ("keepprompt" in self.casmodechunks or "test" in self.casmodechunks)):   # or self.casmode == "doublecross":
-            tojoin = []
-            for i, capt in enumerate(captions[1:]):
-                tojoin.append(f"{{{capt}:{i}}}")
-            captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join(tojoin) + "."
+        # elif self.simpleencode: #  or (self.casmode in ("posattn-opt", "posattn2-opt") and not ("keepprompt" in self.casmodechunks or "test" in self.casmodechunks)):   # or self.casmode == "doublecross":
+        #     tojoin = []
+        #     for i, capt in enumerate(captions[1:]):
+        #         tojoin.append(f"{{{capt}:{i}}}")
+        #     captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join(tojoin) + "."
             
-            _captions, _layerids = _tokenize_annotated_prompt(captions[0], tokenizer=self.tokenizer, minimize_length=minimize_length)
-            captions, layerids = [_captions], [_layerids]
-            encoder_layerids = [torch.ones_like(layerids[-1]) * 0]
+        #     _captions, _layerids = _tokenize_annotated_prompt(captions[0], tokenizer=self.tokenizer, minimize_length=minimize_length)
+        #     captions, layerids = [_captions], [_layerids]
+        #     encoder_layerids = [torch.ones_like(layerids[-1]) * 0]
         else:
             # encode separately
             tokenized_captions = []
             layerids = []
             encoder_layerids = []
              #self.casmode != "global"
+             
+            if self.casmode.augment_global_caption:
+                captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join([e for e in captions[1:]]) + "."
+             
             for i, caption in enumerate(captions):
                 if i == 0:
                     tokenized_caption, layerids_e = _tokenize_annotated_prompt(caption, tokenizer=self.tokenizer, minimize_length=minimize_length)
@@ -1060,13 +1057,8 @@ class COCOPanopticDataset(IterableDataset):
                     layerids.append(torch.ones_like(tokenized_captions[-1]) * i)    
                 encoder_layerids.append(torch.ones_like(layerids[-1]) * i)
             captions = tokenized_captions
-            if not self.use_local:
+            if self.casmode.replace_layerids_with_encoder_layerids:
                 layerids[0] = encoder_layerids[0]
-            else:
-                # retain only global caption
-                captions = [captions[0]]
-                layerids = [layerids[0]]
-                encoder_layerids = [encoder_layerids[0]]
                 
         if self.limitpadding:
             for i in range(len(captions)):
@@ -1158,7 +1150,7 @@ def main(x=0):
     # override pickled defaults
     # cocodataset = COCOPanopticDataset(examples=loadedexamples, casmode="sepswitch", simpleencode=False, mergeregions=True)
     cocodataset = COCOPanopticDataset(maindir="/USERSPACE/lukovdg1/coco2017", split="train", regiondrop=0.5,
-                                      casmode="bothext", simpleencode=True, max_samples=None, mergeregions=True)
+                                      casmode=CASMode("bothext"), simpleencode=True, max_samples=None, mergeregions=True)
     # with open("coco2017.4.dev.pkl", "rb") as f:
     #     cocodataset = pickle.load(f)
     print(len(cocodataset))

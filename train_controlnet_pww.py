@@ -389,11 +389,12 @@ class CustomCrossAttentionCAC(CustomCrossAttentionBaseline):
     
 
 class CustomCrossAttentionDenseDiffusion(CustomCrossAttentionBaseline):
+    # strength values: 0.5 (good) , 1.0 (maybe a bit too strong)
     
     def cross_attention_control(self, sim, context, numheads=None):
         # compute mask that ignores everything except the local descriptions
-        globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
-        max_neg_value = -torch.finfo(sim.dtype).max
+        # globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
+        # max_neg_value = -torch.finfo(sim.dtype).max
         mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
 
         # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
@@ -1335,9 +1336,9 @@ class ControlPWWLDM(ControlLDM):
         cross_attn_masks = {res[0] * res[1]: mask.view(mask.size(0), mask.size(1), -1).transpose(1, 2) for res, mask in cross_attn_masks.items() if res[0] <= 64}
         ret.cross_attn_masks = cross_attn_masks
         
-        if self.cas_name.startswith("legacy"):
+        if self.casmode.name.startswith("legacy"):
             ret.__class__ = CTC_gradio_pww
-            legacymethod= self.cas_name.split("+")[0][len("legacy-"):]
+            legacymethod= self.casmode.name.split("+")[0][len("legacy-"):]
             ret.set_method(legacymethod)
             
         return ret
@@ -1423,7 +1424,8 @@ class ControlPWWLDM(ControlLDM):
         new_caption3[:, 0] = bos
         new_layerids3 = torch.zeros_like(new_caption3)
         new_captiontypes3 = torch.zeros_like(new_caption3) + 1
-        if self.cas_name not in ("cac", "global", "dd") and not self.cas_name.startswith("posattn"):
+        if not self.casmode.use_global_prompt_only:
+        # if self.cas_name not in ("cac", "global", "dd") and not self.cas_name.startswith("posattn") and not self.cas_name.startswith("legacy"):
             new_caption3 = torch.cat([new_caption3, new_caption3], 1)
             new_layerids3 = torch.cat([new_layerids3, new_layerids3 + 1], 1)
             new_captiontypes3 = torch.cat([new_captiontypes3, new_captiontypes3 + 1], 1)
@@ -1590,21 +1592,21 @@ class ControlPWWLDM(ControlLDM):
 #         return ret
     
     
-def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simpleencode=False, threshold=-1, strength=0., softness=0.):
+def convert_model(model, cas_class=None, casmode=None, freezedown=False, simpleencode=False, threshold=-1, strength=0., softness=0.):
     model.__class__ = ControlPWWLDM
     # if simpleencode:
     #     model.__class__ = ControlPWWLDMSimpleEncode
     model.first_stage_key = "image"
     model.control_key = "cond_image"
     model.cond_stage_key = "all"
-    model.cas_name = cas_name
+    model.casmode = casmode
     model.threshold = threshold
     model.strength = strength
     model.softness = softness
     
-    if cas_name is not None:
+    if casmode is not None:
         assert cas_class is None
-        if cas_name.startswith("legacy"):
+        if casmode.name.startswith("legacy"):
             cas_class = CustomCrossAttentionLegacy
         else:
             cas_class = {"both": CustomCrossAttentionBaselineBoth,
@@ -1623,19 +1625,19 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
                         "posattn3": CustomCrossAttentionPosattn3,
                         "posattn-opt": CustomCrossAttentionPosattnOptimized,
                         "posattn2-opt": CustomCrossAttentionPosattn2Optimized,
-                        }[cas_name]
+                        }[casmode.basename]
         
     if cas_class is None:
         cas_class = CustomCrossAttentionBaseline
         
-    print(f"CAS name: {cas_name}")
+    print(f"CAS name: {casmode}")
     print(f"CAS class: {cas_class}")
     
     # DONE: replace CrossAttentions that are at attn2 in BasicTransformerBlocks with adapted CustomCrossAttention that takes into account cross-attention masks
     for module in model.model.diffusion_model.modules():
         if isinstance(module, BasicTransformerBlock): # module.__class__.__name__ == "BasicTransformerBlock":
             assert not module.disable_self_attn
-            if cas_name == "doublecross":
+            if casmode == "doublecross":
                 DoublecrossBasicTransformerBlock.convert(module)
                 module.threshold = threshold
             else:
@@ -1645,7 +1647,7 @@ def convert_model(model, cas_class=None, cas_name=None, freezedown=False, simple
     for module in model.control_model.modules():
         if isinstance(module, BasicTransformerBlock): # module.__class__.__name__ == "BasicTransformerBlock":
             assert not module.disable_self_attn
-            if cas_name == "doublecross":
+            if casmode == "doublecross":
                 DoublecrossBasicTransformerBlock.convert(module)
                 module.threshold = threshold
             else:
@@ -1675,7 +1677,7 @@ def get_checkpointing_callbacks(interval=6*60*60, dirpath=None):
     return [interval_checkpoint, latest_checkpoint]
 
 
-def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='control_v11p_sd15_seg', cas_name="bothext",
+def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='control_v11p_sd15_seg', casmode="bothext",
                                 freezedown=False, simpleencode=False, threshold=-1, strength=0., softness=0.,
                                 loadckpt=""):
     # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
@@ -1687,7 +1689,7 @@ def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='co
     model.base_model_name = basemodelname
     model.controlnet_model_name = model_name
     
-    model = convert_model(model, cas_name=cas_name, freezedown=freezedown, simpleencode=simpleencode, 
+    model = convert_model(model, casmode=casmode, freezedown=freezedown, simpleencode=simpleencode, 
                           threshold=threshold, strength=strength, softness=softness)
     model.sigmas = ((1 - model.alphas_cumprod) / model.alphas_cumprod) ** 0.5
     model.sigmas = torch.cat([torch.zeros_like(model.sigmas[0:1]), model.sigmas], 0)
@@ -1767,7 +1769,7 @@ def _debug_compare():
     
     
     
-    convert_model(model2, cas_name="delegated")
+    convert_model(model2, casmode="delegated")
     # sampler.model = model
     seed_everything(seed=seed)
     
@@ -1787,13 +1789,75 @@ def _debug_compare():
     # END DEBUG
 
 
+class CASMode():
+    def __init__(self, name):
+        self.chunks = name.split("+")
+        self.basename = self.chunks[0]
+        # TODO
+        
+    @property
+    def name(self):
+        return "+".join(self.chunks)
+    
+    @property
+    def use_global_prompt_only(self):
+        if self.basename.startswith("posattn") or \
+           self.basename.startswith("legacy") or \
+           self.basename in ("cac", "dd", "global") :
+            return True
+        else:
+            return False
+        
+    @property
+    def augment_global_caption(self):
+        if "keepprompt" in self.chunks or self.is_test:
+            return False
+        else:
+            if self.name == "doublecross":
+                return True
+            # TODO
+            return True
+        
+    @property
+    def is_test(self):
+        return "test" in self.chunks
+        
+    @property
+    def replace_layerids_with_encoder_layerids(self):
+        if self.use_global_prompt_only:
+            return False
+        else:
+            return True
+        return ("uselocal" in self.casmodechunks) or (self.casmode in ("cac", "posattn", "posattn2", "posattn3", "dd"))       # use local annotations on global prompt and discard local prompts
+        
+    def addchunk(self, chunk:str):
+        self.chunks.append(chunk)
+        return self
+    
+    def __add__(self, chunk:str):
+        return self.addchunk(chunk)
+    
+    def __str__(self):
+        return self.name
+    
+    def __repr__(self):
+        return self.name
+    
+    def __eq__(self, other:str):
+        return self.name.__eq__(other)
+    
+    def __hash__(self):
+        return hash(self.name)
+        
+
+
 def main(batsize=5,
-         version="v4.1",
+         version="v4.2",
          datadir="/USERSPACE/lukovdg1/coco2017/",
          devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          #  devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
-         cas="posattn2", #"posattn2-opt", #"legacy-NewPosAttn+uselocal",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
-         devices=(1,),
+         cas="dd", #"posattn2-opt", #"legacy-NewPosAttn+uselocal",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
+         devices=(0,),
          numtrain=-1,
          regiondrop=-1.,
          controldrop=0.,
@@ -1808,7 +1872,7 @@ def main(batsize=5,
          generateonly=True,
          threshold=0.3,
          softness=0.1,
-         strength=1.5,
+         strength=0.5,
          limitpadding=False,
          loadckpt="",
         #  loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_bothext2_v4.1_exp_2_forreal/latest_all_epoch=epoch=3_step=step=21369.ckpt",
@@ -1822,8 +1886,9 @@ def main(batsize=5,
     print(json.dumps(args, indent=4))     
     ### usage
     # simpleencode=True: only makes sense with both or bothext
+    cas = CASMode(cas)
     if simpleencode:
-        assert cas in ("bothext", "bothext2", "bothminimal")
+        assert cas.basename in ("bothext", "bothext2", "bothminimal")
     print(devices, type(devices), devices[0])
     # Configs
     batch_size = batsize
@@ -1838,12 +1903,12 @@ def main(batsize=5,
     
     expnr = 1
     def get_exp_name(_expnr):
-        ret = f"checkpoints/{version}/checkpoints_coco_{cas}_{version}_exp_{_expnr}{'_forreal' if forreal else ''}"
+        ret = f"checkpoints/{version}/checkpoints_coco_{cas.name}_{version}_exp_{_expnr}{'_forreal' if forreal else ''}"
         if freezedown:
             ret += "_freezedown"
         if simpleencode:
             ret += "_simpleencode"
-        if cas in ("sepswitch",):
+        if cas.name in ("sepswitch",):
             ret += f"_threshold={threshold}"
         return ret
         
@@ -1859,12 +1924,12 @@ def main(batsize=5,
             loadedexamples_e = pkl.load(f)
             loadedexamples += loadedexamples_e
     # override pickled defaults
-    valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas + "+test", simpleencode=simpleencode, 
+    valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas + "test", simpleencode=simpleencode, 
                                    mergeregions=mergeregions, limitpadding=limitpadding, 
                                    max_masks=28 if limitpadding else 10)
     valid_dl = COCODataLoader(valid_ds, batch_size=4, num_workers=4 if forreal else 0, shuffle=False)
     
-    model = create_controlnet_pww_model(cas_name=cas, freezedown=freezedown, simpleencode=simpleencode, 
+    model = create_controlnet_pww_model(casmode=cas, freezedown=freezedown, simpleencode=simpleencode, 
                                         threshold=threshold, strength=strength, softness=softness, 
                                         loadckpt=loadckpt)
     model.set_control_drop(controldrop)

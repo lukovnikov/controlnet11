@@ -1,3 +1,5 @@
+import copy
+import json
 from pathlib import Path
 import re
 from PIL import Image
@@ -9,6 +11,7 @@ import torch
 import pickle
 
 import numpy as np
+import tqdm
 
 
 
@@ -52,9 +55,32 @@ def run():
     logits_per_image = outputs.logits_per_image  # this is the image-text similarity score
     probs = logits_per_image.softmax(dim=1)  # we can take the softmax to get the label probabilities
     print(probs)
-
-
+    
+    
+class MetricScore():
+    def __init__(self, name, higher_is_better=True):
+        self.name = name
+        self.higher_is_better = higher_is_better
+        
+    def __hash__(self) -> int:
+        return hash(self.name)
+    
+    def __eq__(self, other):
+        return str(self).__eq__(str(other))
+    
+    def __str__(self):
+        return f"Metric[{self.name},{'+' if self.higher_is_better else '-'}]"
+    
+    def __repr__(self):
+        return str(self)
+    
+    
 class LocalCLIPEvaluator():
+    LOGITS = MetricScore("localclip_logits")
+    COSINE = MetricScore("localclip_cosine")
+    PROBS = MetricScore("localclip_probs")
+    ACCURACY = MetricScore("localclip_acc")
+    
     def __init__(self, clipmodel, clipprocessor, tightcrop=True, fill="none"):
         super().__init__()
         self.clipmodel, self.clipprocessor, self.tightcrop, self.fill = clipmodel, clipprocessor, tightcrop, fill
@@ -132,10 +158,15 @@ class LocalCLIPEvaluator():
         prob_per_image = logits_per_image.softmax(-1)
         acc_per_image = logits_per_image.softmax(-1).max(-1)[1] == torch.arange(len(logits_per_image), device=logits_per_image.device)
         # probs = logits_per_image.softmax(dim=1)
-        return logits_per_image.diag(), cosine_per_image.diag(), prob_per_image.diag(), acc_per_image.float()
+        return {self.LOGITS: logits_per_image.diag().mean().detach().cpu().item(),
+                self.COSINE: cosine_per_image.diag().mean().detach().cpu().item(),
+                self.PROBS: prob_per_image.diag().mean().detach().cpu().item(),
+                self.ACCURACY: acc_per_image.float().mean().detach().cpu().item()}
 
 
 class AestheticsPredictor():
+    SCORE = MetricScore("laion_aest_score")
+    
     weight_url_dict = {
         "openai/clip-vit-base-patch32": "https://github.com/LAION-AI/aesthetic-predictor/raw/main/sa_0_4_vit_b_32_linear.pth",
         "openai/clip-vit-large-patch14": "https://github.com/LAION-AI/aesthetic-predictor/raw/main/sa_0_4_vit_l_14_linear.pth",
@@ -193,13 +224,43 @@ class AestheticsPredictor():
         
     def run(self, x):
         image = x.load_image()
-        return self.run_image(image)
+        return {self.SCORE: self.run_image(image), }
+    
+
+class MANIQAEvaluator():
+    SCORE = MetricScore("maniqa")
+    def __init__(self, device=torch.device("cuda"), **kw):
+        import pyiqa
+        super().__init__(**kw)
+        self.metric = pyiqa.create_metric("maniqa", device=device, as_loss=False)
+        
+    def run(self, x):
+        image = x.load_image()
+        score = self.metric(image)
+        assert score.shape == (1, 1)
+        return {self.SCORE: score[0, 0].detach().cpu().item()}
+    
+
+class BRISQUEEvaluator():
+    SCORE = MetricScore("brisque", higher_is_better=False)
+    def __init__(self, device=torch.device("cuda"), **kw):
+        import pyiqa
+        super().__init__(**kw)
+        self.metric = pyiqa.create_metric("brisque", device=device, as_loss=False)
+        
+    def run(self, x):
+        image = x.load_image()
+        score = self.metric(image)
+        assert score.shape == (1,)
+        return {self.SCORE: score[0].detach().cpu().item()}
         
     
 def do_example(x, **evaluators):
     ret = {}
-    for k, v in evaluators.items():
-        ret[k] = v.run(x)
+    for _, evaluator in evaluators.items():
+        resultdic = evaluator.run(x)
+        for k, v in resultdic.items():
+            ret[k] = v
     return ret
 
     
@@ -222,7 +283,7 @@ def run2(path="coco2017.4dev.examples.pkl"):
     
     
 def run3(
-         path="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn2_v4.1_exp_21/generated_1",
+         path="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_global_v4.2_exp_1/generated_3",
          tightcrop=True,
          fill="none",
          device=0,
@@ -239,34 +300,71 @@ def run3(
     print("loading models for evaluation")
     clipevaluator = LocalCLIPEvaluator(model, processor, tightcrop=tightcrop, fill=fill)
     aestheticspredictor = AestheticsPredictor(clip_version, device=device)
+    maniqaevaluator = MANIQAEvaluator(device=device)
+    brisque = BRISQUEEvaluator(device=device)
+    
     print("model loaded")
         
+    colnames = None
+    higherbetter = []
     allmetrics = []
         
-    print("iterating over batches")
-    for batch in loadedexamples:
-        batch_metrics = []
-        for example in batch:       # all examples in one batch have been generated as different seeds of the same starting point
-            outputs = do_example(example, clipevaluator=clipevaluator, aestheticspredictor=aestheticspredictor)
-            local_clip_metrics = outputs["clipevaluator"]      # metrics here are over regions in this one example
-            example_metrics = [metric.mean().cpu().item() for metric in local_clip_metrics]
-            example_metrics.append(outputs["aestheticspredictor"])
-            batch_metrics.append(tuple(example_metrics))
-        allmetrics.append(batch_metrics)        # aggregate over all batches --> (numbats, numseeds, nummetrics)
+    with torch.no_grad():
+        print("iterating over batches")
+        for batch in tqdm.tqdm(loadedexamples):
+            batch_metrics = []
+            for example in batch:       # all examples in one batch have been generated as different seeds of the same starting point
+                outputs = do_example(example, clipevaluator=clipevaluator, aestheticspredictor=aestheticspredictor, maniqa=maniqaevaluator, brisque=brisque)
+                outputcolnames, outputdata = zip(*sorted(outputs.items(), key=lambda x: x[0].name))
+                if colnames is None:
+                    colnames = copy.deepcopy(outputcolnames)
+                assert colnames == outputcolnames
+                batch_metrics.append(tuple(outputdata))
+                # local_clip_metrics = outputs["clipevaluator"]      # metrics here are over regions in this one example
+                # example_metrics = [metric.mean().cpu().item() for metric in local_clip_metrics]
+                # example_metrics.append(outputs["aestheticspredictor"])
+                # example_metrics.append(outputs["maniqa"])
+                # example_metrics.append(outputs["brisque"])
+                # batch_metrics.append(tuple(example_metrics))
+            allmetrics.append(batch_metrics)        # aggregate over all batches --> (numbats, numseeds, nummetrics)
     allmetrics = np.array(allmetrics)
         
     # compute averages per seed --> (nummetrics, numseeds,)
     means_per_seed = allmetrics.mean(0).T
+    
     means_over_seeds = means_per_seed.mean(1)
     stds_over_seeds = means_per_seed.std(1)
     
-    best_over_seeds = allmetrics.max(1).mean(0)
-        
-    print(means_over_seeds)
-    print(stds_over_seeds)
-    print(best_over_seeds)
+    higher_is_better = np.array([True if colname.higher_is_better else False for colname in colnames])
+    max_over_seeds = allmetrics.max(1).mean(0)
+    min_over_seeds = allmetrics.min(1).mean(0)
+    best_over_seeds = np.where(higher_is_better, max_over_seeds, min_over_seeds)
     
-    print("done")
+    means_over_seeds_dict = dict(zip(colnames, list(means_over_seeds)))
+    stds_over_seeds_dict = dict(zip(colnames, list(stds_over_seeds)))
+    best_over_seeds_dict = dict(zip(colnames, list(best_over_seeds)))
+        
+    print(means_over_seeds_dict)
+    print(stds_over_seeds_dict)
+    print(best_over_seeds_dict)
+    
+    means_over_seeds_dict = {str(k): v for k, v in means_over_seeds_dict.items()}
+    stds_over_seeds_dict = {str(k): v for k, v in stds_over_seeds_dict.items()}
+    best_over_seeds_dict = {str(k): v for k, v in best_over_seeds_dict.items()}
+    
+    tosave = {     "means": means_over_seeds_dict, 
+                   "stds": stds_over_seeds_dict, 
+                   "best": best_over_seeds_dict, 
+                #    "alldata": allmetrics, 
+                #    "colnames": colnames
+             } 
+    
+    with open(Path(path) / "evaluation_results.json", "w") as f:
+        json.dump(tosave, 
+                  f, 
+                  indent=4)
+    print(json.dumps(tosave, indent=4))
+    print(f"saved in {Path(path)}")
     
     
 def tst_aesthetics():
