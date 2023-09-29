@@ -557,16 +557,14 @@ class CustomCrossAttentionPosattn2(CustomCrossAttentionBaseline):
     def cross_attention_control(self, sim, context, numheads=None):
         assert torch.all(context.progress == context.progress[0])
         if hasattr(context, "threshold_lot") and torch.all(context.progress[0] < context.threshold_lot):
-            sim = CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
-            return (sim * self.scale).softmax(-1)
+            return CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
         # compute mask that ignores everything except the local descriptions
         globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
-        assert torch.all(globalmask[:, :, :77] == 1)
-        assert torch.all(globalmask[:, :, 77:] == 0)
-        globalmask = globalmask[0:1, :, :]
-        simscale = sim[:, :, :77].std(-1, keepdim=True)
+        globalmaskext = globalmask[:, None].repeat(1, numheads, 1, 1)
+        globalmaskext = globalmaskext.view(-1, globalmaskext.shape[-2], globalmaskext.shape[-1])
+        # assert torch.all(globalmask == 1)
         max_neg_value = -torch.finfo(sim.dtype).max
-        sim = sim.masked_fill(globalmask == 0, max_neg_value)
+        sim = sim.masked_fill(globalmaskext == 0, max_neg_value)
         mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
 
         # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
@@ -586,6 +584,8 @@ class CustomCrossAttentionPosattn2(CustomCrossAttentionBaseline):
         boostmask = boostmask * weight
         boostmaskext = boostmask[:, None].repeat(1, numheads, 1, 1)
         boostmaskext = boostmaskext.view(-1, boostmaskext.shape[-2], boostmaskext.shape[-1])
+        
+        simscale = sim.std(-1, keepdims=True)
         
         sim = sim + boostmaskext * context.strength * simscale
         
@@ -608,15 +608,14 @@ class CustomCrossAttentionPosattn3(CustomCrossAttentionPosattn2):
     def cross_attention_control(self, sim, context, numheads=None):
         assert torch.all(context.progress == context.progress[0])
         if hasattr(context, "threshold_lot") and torch.all(context.progress[0] < context.threshold_lot):
-            sim = CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
-            return (sim * self.scale).softmax(-1)
+            return CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
         # compute mask that ignores everything except the local descriptions
         globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
-        assert torch.all(globalmask[:, :, :77] == 1)
-        assert torch.all(globalmask[:, :, 77:] == 0)
-        globalmask = globalmask[0:1, :, :]
+        globalmaskext = globalmask[:, None].repeat(1, numheads, 1, 1)
+        globalmaskext = globalmaskext.view(-1, globalmaskext.shape[-2], globalmaskext.shape[-1])
+        # assert torch.all(globalmask == 1)
         max_neg_value = -torch.finfo(sim.dtype).max
-        sim = sim.masked_fill(globalmask == 0, max_neg_value)
+        sim = sim.masked_fill(globalmaskext == 0, max_neg_value)
         mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
 
         # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
@@ -661,15 +660,14 @@ class CustomCrossAttentionPosattn4(CustomCrossAttentionPosattn3):
     def cross_attention_control(self, sim, context, numheads=None):
         assert torch.all(context.progress == context.progress[0])
         if hasattr(context, "threshold_lot") and torch.all(context.progress[0] < context.threshold_lot):
-            sim = CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
-            return (sim * self.scale).softmax(-1)
+            return CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
         # compute mask that ignores everything except the local descriptions
         globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
-        assert torch.all(globalmask[:, :, :77] == 1)
-        assert torch.all(globalmask[:, :, 77:] == 0)
-        globalmask = globalmask[0:1, :, :]
+        globalmaskext = globalmask[:, None].repeat(1, numheads, 1, 1)
+        globalmaskext = globalmaskext.view(-1, globalmaskext.shape[-2], globalmaskext.shape[-1])
+        # assert torch.all(globalmask == 1)
         max_neg_value = -torch.finfo(sim.dtype).max
-        sim = sim.masked_fill(globalmask == 0, max_neg_value)
+        sim = sim.masked_fill(globalmaskext == 0, max_neg_value)
         mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
 
         # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
@@ -720,15 +718,14 @@ class CustomCrossAttentionPosattn5(CustomCrossAttentionPosattn2):
     def cross_attention_control(self, sim, context, numheads=None):
         assert torch.all(context.progress == context.progress[0])
         if hasattr(context, "threshold_lot") and torch.all(context.progress[0] < context.threshold_lot):
-            sim = CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
-            return (sim * self.scale).softmax(-1)
+            return CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
         # compute mask that ignores everything except the local descriptions
         globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
-        assert torch.all(globalmask[:, :, :77] == 1)
-        assert torch.all(globalmask[:, :, 77:] == 0)
-        globalmask = globalmask[0:1, :, :]
+        globalmaskext = globalmask[:, None].repeat(1, numheads, 1, 1)
+        globalmaskext = globalmaskext.view(-1, globalmaskext.shape[-2], globalmaskext.shape[-1])
+        # assert torch.all(globalmask == 1)
         max_neg_value = -torch.finfo(sim.dtype).max
-        sim = sim.masked_fill(globalmask == 0, max_neg_value)
+        sim = sim.masked_fill(globalmaskext == 0, max_neg_value)
         mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
 
         # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
@@ -742,10 +739,18 @@ class CustomCrossAttentionPosattn5(CustomCrossAttentionPosattn2):
         mask2ext = mask2ext.view(-1, mask2ext.shape[-2], mask2ext.shape[-1])
         
         # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
+        # boostmask = mask * mask2        # selects only those tokens not belonging to any regional description
         a, b = max(0, context.threshold - context.softness / 2), min(context.threshold + context.softness / 2, 1)
         weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
         weightext = weight[:, None].repeat(1, numheads, 1, 1)
         weightext = weightext.view(-1, weightext.shape[-2], weightext.shape[-1])
+        # boostmask = boostmask * weight
+        # boostmaskext = boostmask[:, None].repeat(1, numheads, 1, 1)
+        # boostmaskext = boostmaskext.view(-1, boostmaskext.shape[-2], boostmaskext.shape[-1])
+        
+        # simscale = sim.std(-1, keepdims=True)
+        
+        # sim = sim + boostmaskext * context.strength * simscale
         
         # do mixture of two distributions: one over region tokens, and one over non-region tokens
         sim = sim * self.scale
@@ -770,15 +775,14 @@ class CustomCrossAttentionPosattn5b(CustomCrossAttentionPosattn5):
     def cross_attention_control(self, sim, context, numheads=None):
         assert torch.all(context.progress == context.progress[0])
         if hasattr(context, "threshold_lot") and torch.all(context.progress[0] < context.threshold_lot):
-            sim = CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
-            return (sim * self.scale).softmax(-1)
+            return CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
         # compute mask that ignores everything except the local descriptions
         globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
-        assert torch.all(globalmask[:, :, :77] == 1)
-        assert torch.all(globalmask[:, :, 77:] == 0)
-        globalmask = globalmask[0:1, :, :]
+        globalmaskext = globalmask[:, None].repeat(1, numheads, 1, 1)
+        globalmaskext = globalmaskext.view(-1, globalmaskext.shape[-2], globalmaskext.shape[-1])
+        # assert torch.all(globalmask == 1)
         max_neg_value = -torch.finfo(sim.dtype).max
-        sim = sim.masked_fill(globalmask == 0, max_neg_value)
+        sim = sim.masked_fill(globalmaskext == 0, max_neg_value)
         mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
 
         # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
@@ -840,15 +844,14 @@ class CustomCrossAttentionPosattn5c(CustomCrossAttentionPosattn5):
     def cross_attention_control(self, sim, context, numheads=None):
         assert torch.all(context.progress == context.progress[0])
         if hasattr(context, "threshold_lot") and torch.all(context.progress[0] < context.threshold_lot):
-            sim = CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
-            return (sim * self.scale).softmax(-1)
+            return CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
         # compute mask that ignores everything except the local descriptions
         globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
-        assert torch.all(globalmask[:, :, :77] == 1)
-        assert torch.all(globalmask[:, :, 77:] == 0)
-        globalmask = globalmask[0:1, :, :]
+        globalmaskext = globalmask[:, None].repeat(1, numheads, 1, 1)
+        globalmaskext = globalmaskext.view(-1, globalmaskext.shape[-2], globalmaskext.shape[-1])
+        # assert torch.all(globalmask == 1)
         max_neg_value = -torch.finfo(sim.dtype).max
-        sim = sim.masked_fill(globalmask == 0, max_neg_value)
+        sim = sim.masked_fill(globalmaskext == 0, max_neg_value)
         mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
 
         # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
@@ -925,15 +928,14 @@ class CustomCrossAttentionPosattn5u(CustomCrossAttentionPosattn5):
     def cross_attention_control(self, sim, context, numheads=None):
         assert torch.all(context.progress == context.progress[0])
         if hasattr(context, "threshold_lot") and torch.all(context.progress[0] < context.threshold_lot):
-            sim = CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
-            return (sim * self.scale).softmax(-1)
+            return CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
         # compute mask that ignores everything except the local descriptions
         globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
-        assert torch.all(globalmask[:, :, :77] == 1)
-        assert torch.all(globalmask[:, :, 77:] == 0)
-        globalmask = globalmask[0:1, :, :]
+        globalmaskext = globalmask[:, None].repeat(1, numheads, 1, 1)
+        globalmaskext = globalmaskext.view(-1, globalmaskext.shape[-2], globalmaskext.shape[-1])
+        # assert torch.all(globalmask == 1)
         max_neg_value = -torch.finfo(sim.dtype).max
-        sim = sim.masked_fill(globalmask == 0, max_neg_value)
+        sim = sim.masked_fill(globalmaskext == 0, max_neg_value)
         mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
 
         # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
@@ -947,10 +949,18 @@ class CustomCrossAttentionPosattn5u(CustomCrossAttentionPosattn5):
         mask2ext = mask2ext.view(-1, mask2ext.shape[-2], mask2ext.shape[-1])
         
         # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
+        # boostmask = mask * mask2        # selects only those tokens not belonging to any regional description
         a, b = max(0, context.threshold - context.softness / 2), min(context.threshold + context.softness / 2, 1)
         weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
         weightext = weight[:, None].repeat(1, numheads, 1, 1)
         weightext = weightext.view(-1, weightext.shape[-2], weightext.shape[-1])
+        # boostmask = boostmask * weight
+        # boostmaskext = boostmask[:, None].repeat(1, numheads, 1, 1)
+        # boostmaskext = boostmaskext.view(-1, boostmaskext.shape[-2], boostmaskext.shape[-1])
+        
+        # simscale = sim.std(-1, keepdims=True)
+        
+        # sim = sim + boostmaskext * context.strength * simscale
         
         # do mixture of two distributions: one over region tokens, and one over non-region tokens
         sim = sim * self.scale
@@ -1590,7 +1600,6 @@ class ControlPWWLDM(ControlLDM):
     padlimit = 1  #5
     optiminit_lr = 0.1
     optiminit_numsteps = 20
-    threshold_lot = -1
     
     # @torch.no_grad()
     # def get_input(self, batch, k, bs=None, *args, **kwargs):
@@ -1720,7 +1729,6 @@ class ControlPWWLDM(ControlLDM):
         ret.threshold = self.threshold
         ret.softness = self.softness
         ret.strength = self.strength
-        ret.threshold_lot = self.threshold_lot
         
         ret.captiontypes = cond["captiontypes"]
         
@@ -1995,7 +2003,6 @@ def convert_model(model, cas_class=None, casmode=None, freezedown=False, simplee
     model.threshold = threshold
     model.strength = strength
     model.softness = softness
-    model.threshold_lot = casmode.threshold_lot
     
     if casmode is not None:
         assert cas_class is None
@@ -2191,14 +2198,11 @@ class CASMode():
     def __init__(self, name):
         self.chunks = name.split("+")
         self.basename = self.chunks[0]
-        self.threshold_lot = -1.
         
         self.localonlytil = False
         for chunk in self.chunks:
-            m = re.match(r"lot(\d\.\d+)", chunk)
-            if m:
+            if re.match(r"lot\d\.\d+", chunk):
                 self.localonlytil = True
-                self.threshold_lot = float(m.group(1))
         
     @property
     def name(self):
