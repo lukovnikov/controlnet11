@@ -443,7 +443,12 @@ class CustomCrossAttentionPosattn(CustomCrossAttentionBaseline):
     def cross_attention_control(self, sim, context, numheads=None):
         # compute mask that ignores everything except the local descriptions
         globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
+        assert torch.all(globalmask[:, :, :77] == 1)
+        assert torch.all(globalmask[:, :, 77:] == 0)
+        globalmask = globalmask[0:1, :, :]
+        simscale = sim[:, :, :77].std(-1, keepdim=True)
         max_neg_value = -torch.finfo(sim.dtype).max
+        sim = sim.masked_fill(globalmask == 0, max_neg_value)
         mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
 
         # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
@@ -465,10 +470,10 @@ class CustomCrossAttentionPosattn(CustomCrossAttentionBaseline):
         boostmask = boostmask[:, None].repeat(1, numheads, 1, 1)
         boostmask = boostmask.view(-1, boostmask.shape[-2], boostmask.shape[-1])
         
-        ret = sim + boostmask * context.strength * sim.std()
+        ret = sim + boostmask * context.strength * simscale #sim.std()
         
-        # don't attend to other region-specific tokens or non-global prompt ones
-        ret.masked_fill_(mask == 0, max_neg_value)
+        # # don't attend to other region-specific tokens or non-global prompt ones
+        # ret.masked_fill_(mask == 0, max_neg_value)
         
         return ret
     
@@ -762,6 +767,69 @@ class CustomCrossAttentionPosattn5(CustomCrossAttentionPosattn2):
         return outprobs
     
     
+class CustomCrossAttentionPosattn5a(CustomCrossAttentionPosattn2):  # "a" for additive: we boost regional part using addition instead of multiplication
+    # when attending from a region:   tokens belonging to other regions are completely ignored 
+    #                                 and all their probability is transfered to the correct region's tokens
+    # additional boosting of attention can be done according to a schedule, this boosting
+    #    multiplies the fraction of region-specific attention with the boost factor, 
+    #    so heads and layers where a lot of probability was spent on region-specific tokens see a larger increase
+    #    while heads that did not attend to any regions see no increase (unlike addition-based boosting)
+    
+    def cross_attention_control(self, sim, context, numheads=None):
+        assert torch.all(context.progress == context.progress[0])
+        if hasattr(context, "threshold_lot") and torch.all(context.progress[0] < context.threshold_lot):
+            sim = CustomCrossAttentionSepSwitch.cross_attention_control(self, sim, context, numheads=numheads)
+            return (sim * self.scale).softmax(-1)
+        # compute mask that ignores everything except the local descriptions
+        globalmask = context.global_prompt_mask[:, None].to(sim.dtype)
+        assert torch.all(globalmask[:, :, :77] == 1)
+        assert torch.all(globalmask[:, :, 77:] == 0)
+        globalmask = globalmask[0:1, :, :]
+        max_neg_value = -torch.finfo(sim.dtype).max
+        sim = sim.masked_fill(globalmask == 0, max_neg_value)
+        mask = context.cross_attn_masks[sim.shape[1]].to(sim.dtype)
+
+        # get the mask back to 0/1, make sure we only attend to at most one of the local descriptions at once
+        maskmaxes = mask.max(-1, keepdim=True)[0]
+        mask = (mask >= (maskmaxes.clamp_min(1e-3) - 1e-4)).float()
+        maskext = mask[:, None].repeat(1, numheads, 1, 1)
+        maskext = maskext.view(-1, maskext.shape[-2], maskext.shape[-1])
+        
+        mask2 = (context.layer_ids[:, None] != 0).to(sim.dtype).to(sim.device)
+        mask2ext = mask2[:, None].repeat(1, numheads, 1, 1)
+        mask2ext = mask2ext.view(-1, mask2ext.shape[-2], mask2ext.shape[-1])
+        
+        # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
+        a, b = max(0, context.threshold[0] - context.softness[0] / 2), min(context.threshold[0] + context.softness[0] / 2, 1)
+        weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
+        weightext = weight[:, None].repeat(1, numheads, 1, 1)
+        weightext = weightext.view(-1, weightext.shape[-2], weightext.shape[-1])
+        
+        a2, b2 = max(0, context.threshold[1] - context.softness[1] / 2), min(context.threshold[1] + context.softness[1] / 2, 1)
+        weight2 = 1 - _threshold_f(context.progress, a2, b2)[:, None, None]
+        weightext2 = weight2[:, None].repeat(1, numheads, 1, 1)
+        weightext2 = weightext2.view(-1, weightext2.shape[-2], weightext2.shape[-1])
+        
+        # do mixture of two distributions: one over region tokens, and one over non-region tokens
+        sim = sim * self.scale
+        probs_vanilla = sim.softmax(-1)
+        prob_mass_of_regions = (probs_vanilla * mask2ext).sum(-1, keepdims=True)
+        prob_mass_of_regions = prob_mass_of_regions * (1 + context.strength[0] * weightext)
+        prob_mass_of_regions.clamp_(0, 1)
+        
+        boostmaskext = maskext * mask2ext
+        S = boostmaskext.sum(1, keepdims=True) / boostmaskext.shape[1]
+        surfacemod = (((1 - S) * boostmaskext).sum(-1, keepdim=True) / boostmaskext.sum(-1, keepdim=True).clamp_min(1e-6))
+        prob_mass_of_regions = prob_mass_of_regions + (1 - prob_mass_of_regions) * (context.strength[1] * weightext2) * surfacemod
+        
+        probs_inside_regions = sim.masked_fill(maskext * mask2ext == 0, max_neg_value).softmax(-1)
+        probs_outside_regions = sim.masked_fill(mask2ext == 1, max_neg_value).softmax(-1)
+        
+        outprobs = prob_mass_of_regions * probs_inside_regions + (1 - prob_mass_of_regions) * probs_outside_regions
+        
+        return outprobs
+    
+    
 class CustomCrossAttentionPosattn5b(CustomCrossAttentionPosattn5):
     # adds rebalancing of tokens within region descriptions: HOW?
     #    - makes sure that all words are attended to equally, when all pixels in the region considered
@@ -880,43 +948,6 @@ class CustomCrossAttentionPosattn5c(CustomCrossAttentionPosattn5):
         
         outprobs = prob_mass_of_regions * probs_inside_regions + (1 - prob_mass_of_regions) * probs_outside_regions
         return outprobs
-        
-        
-        
-        # # do mixture of two distributions: one over region tokens, and one over non-region tokens
-        # sim = sim * self.scale
-        # probs_vanilla = sim.softmax(-1)
-        # prob_mass_of_regions = (probs_vanilla * mask2ext).sum(-1, keepdims=True)
-        # prob_mass_of_regions = prob_mass_of_regions * (1 + context.strength * weightext) 
-        # prob_mass_of_regions.clamp_(0, 1)
-        
-        # boostmask = maskext * mask2ext
-        
-        # # ONLY FOR CHECKING HOW PROBMASSES CHANGED:
-        # # probs_inside_regions_A = sim.masked_fill(boostmask == 0, max_neg_value).softmax(-1)
-        # # probmasses_A = probs_inside_regions_A.sum(1, keepdim=True) * mask2ext
-        
-        # sim_masked = sim.masked_fill(boostmask == 0, 0)
-        # sim_mean_per_token = sim_masked.sum(-2, keepdim=True) \
-        #     / (boostmask).sum(-2, keepdim=True).clamp_min(1e-6)
-        # sim_diff_per_token = sim_masked - sim_mean_per_token
-        # sim_mean_sum = (sim_mean_per_token * boostmask).sum(-1, keepdim=True)
-        # numtokens_per_pixel = boostmask.sum(-1, keepdims=True)
-        # sim_mean_target = sim_mean_sum / numtokens_per_pixel.clamp_min(1e-6)
-        # newsim_masked = sim_mean_target + sim_diff_per_token
-        
-        # # ONLY FOR CHECKING HOW PROBMASSES CHANGED:
-        # # probs_inside_regions_B = newsim_masked.masked_fill(boostmask == 0, max_neg_value).softmax(-1)
-        # # probmasses_B = probs_inside_regions_B.sum(1, keepdim=True) * mask2ext
-        
-        # probs_inside_regions = newsim_masked.masked_fill(boostmask == 0, max_neg_value).softmax(-1)
-        # probs_outside_regions = sim.masked_fill(mask2ext == 1, max_neg_value).softmax(-1)
-        
-        # outprobs = prob_mass_of_regions * probs_inside_regions + (1 - prob_mass_of_regions) * probs_outside_regions
-        
-        # # probmasses_out = outprobs.sum(1, keepdim=True) #* mask2ext
-        
-        # return outprobs
 
 
 class CustomCrossAttentionPosattn5u(CustomCrossAttentionPosattn5):   
@@ -2018,6 +2049,7 @@ def convert_model(model, cas_class=None, casmode=None, freezedown=False, simplee
                         "posattn3": CustomCrossAttentionPosattn3,       # same as 2, sim.max() scaling similar to DenseDiffusion
                         "posattn4": CustomCrossAttentionPosattn4,       # same as 3, + scaling based on region size like in DenseDiffusion
                         "posattn5": CustomCrossAttentionPosattn5,       # same as 2, but using strength as multiplier to attentuate region-specific attention
+                        "posattn5a": CustomCrossAttentionPosattn5a,       # same as 2, but using strength as multiplier to attentuate region-specific attention
                         "posattn5b": CustomCrossAttentionPosattn5b,       # same as 2, but rebalanced tokens within a region's description
                         "posattn5c": CustomCrossAttentionPosattn5c,       # same as 2, but rebalanced tokens within a region's description
                         "posattn5u": CustomCrossAttentionPosattn5u,       # same as 2, but uniform everywhere across all tokens within region description
@@ -2077,7 +2109,7 @@ def get_checkpointing_callbacks(interval=6*60*60, dirpath=None):
 
 def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='control_v11p_sd15_seg', casmode="bothext",
                                 freezedown=False, simpleencode=False, threshold=-1, strength=0., softness=0.,
-                                loadckpt=""):
+                                extendedcontrol=False, loadckpt=""):
     # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
     model = create_model(f'./models/{model_name}.yaml').cpu()
     # load main weights
@@ -2093,15 +2125,17 @@ def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='co
     model.sigmas = torch.cat([torch.zeros_like(model.sigmas[0:1]), model.sigmas], 0)
     
     if loadckpt != "":
-        print(f"loading trained parameters from {loadckpt}")
-        # refparam1a = model.model.diffusion_model.middle_block[1].proj_in.weight.data.clone()
-        # refparam2a = deepcopy(model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2l.to_q.weight.data.clone())
-        ckpt_state_dict = load_state_dict(loadckpt, location="cpu")
-        # testing the partial loading
-        model.load_state_dict(ckpt_state_dict, strict=False)
-        # refparam1b = model.model.diffusion_model.middle_block[1].proj_in.weight.data.clone()
-        # refparam2b = deepcopy(model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2l.to_q.weight.data.clone())
-        # assert torch.all(refparam1a == refparam1b)
+        for loadckpt_e in loadckpt.split(","):
+            if loadckpt_e != "":
+                print(f"loading trained parameters from {loadckpt_e}")
+                # refparam1a = model.model.diffusion_model.middle_block[1].proj_in.weight.data.clone()
+                # refparam2a = deepcopy(model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2l.to_q.weight.data.clone())
+                ckpt_state_dict = load_state_dict(loadckpt, location="cpu")
+                # testing the partial loading
+                model.load_state_dict(ckpt_state_dict, strict=False)
+                # refparam1b = model.model.diffusion_model.middle_block[1].proj_in.weight.data.clone()
+                # refparam2b = deepcopy(model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2l.to_q.weight.data.clone())
+                # assert torch.all(refparam1a == refparam1b)
     return model
 
 
@@ -2261,11 +2295,11 @@ class CASMode():
 
 
 def main(batsize=5,
-         version="v4.2",
+         version="v5",
          datadir="/USERSPACE/lukovdg1/coco2017/",
          devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          #  devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
-         cas="posattn2+lot0.1", #"posattn2-opt", #"legacy-NewPosAttn+uselocal",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
+         cas="posattn5a", #"posattn2-opt", #"legacy-NewEdiffipp",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
          devices=(0,),
          numtrain=-1,
          regiondrop=-1.,
@@ -2279,11 +2313,16 @@ def main(batsize=5,
         #  generate="alldev",   # ""
          # generate="",
          generateonly=True,
-         threshold=1.,
-         softness=0.8,
-         strength=10.,
+         threshold=(0., 0.),
+         softness=(3., 0.6),
+         strength=(4., 0.),
+        #  threshold=0.0,
+        #  softness=3,
+        #  strength=4,
          limitpadding=False,
-         loadckpt="",
+         extendedcontrol=False,
+        #  loadckpt="",
+         loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/pretrain-v4.2/checkpoints_coco_controlnetmod_hint_exp_1_forreal/interval_delta_epoch=epoch=4_step=step=50086.ckpt",
         #  loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_bothext2_v4.1_exp_2_forreal/latest_all_epoch=epoch=3_step=step=21369.ckpt",
         #  loadckpt="/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/interval_delta_epoch=epoch=2_step=step=23145.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_bothext_v4_exp_12_forreal/interval_delta_epoch=epoch=2_step=step=22068.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v3/checkpoints_coco_bothext_v3_exp_2_forreal/interval_delta_epoch=epoch=2_step=step=23145.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_bothext_v4_exp_5_forreal/interval_delta_epoch=epoch=2_step=step=23339.ckpt", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v4/checkpoints_coco_doublecross_v4_exp_2_forreal/latest_all_epoch=epoch=1_step=step=19541.ckpt",
         #  loadckpt="", #"/USERSPACE/lukovdg1/controlnet11/checkpoints/v2/checkpoints_coco_doublecross_v2_exp_1_forreal/interval_delta_epoch=epoch=5_step=step=64069.ckpt", #"",
@@ -2340,7 +2379,7 @@ def main(batsize=5,
     
     model = create_controlnet_pww_model(casmode=cas, freezedown=freezedown, simpleencode=simpleencode, 
                                         threshold=threshold, strength=strength, softness=softness, 
-                                        loadckpt=loadckpt)
+                                        extendedcontrol=extendedcontrol, loadckpt=loadckpt)
     model.set_control_drop(controldrop)
     model.limitpadding = limitpadding
     

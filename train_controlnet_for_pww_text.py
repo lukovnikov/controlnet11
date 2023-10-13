@@ -22,12 +22,13 @@ from torchvision.utils import make_grid
 
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
-from cldm.cldm import ControlLDM
+from cldm.cldm import ControlLDM, ControlNet
 from cldm.logger import ImageLogger, nested_to
 from cldm.model import create_model, load_state_dict
 from dataset import COCOPanopticDataset, COCODataLoader
 from ldm.modules.attention import BasicTransformerBlock, default
-from ldm.modules.diffusionmodules.util import torch_cat_nested
+from ldm.modules.diffusionmodules.openaimodel import TimestepBlock, TimestepEmbedSequential
+from ldm.modules.diffusionmodules.util import conv_nd, timestep_embedding, torch_cat_nested
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
 from ldm.util import SeedSwitch, log_txt_as_img, seed_everything
 
@@ -36,38 +37,176 @@ from gradio_pww import _tokenize_annotated_prompt, create_tools, CustomTextCondi
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
 
+class CustomTextConditioning():
+    def __init__(self, global_text_cond=None, local_text_cond=None):
+        self.global_text_cond, self.local_text_cond = global_text_cond, local_text_cond
+    
+    def flatten_inputs_for_gradient_checkpoint(self):
+        flat_out = [self.global_text_cond, self.local_text_cond]
+        def recon_f(x:list):
+            self.global_text_cond = x[0]
+            self.local_text_cond = x[1]
+            return self
+        return flat_out, recon_f
+    
+    def torch_cat_nested(self, other):
+        # concatenate all torch tensors along batch dimension
+        ret = deepcopy(self)
+        batsize = self.embs.shape[0]
+        for k, v in self.__dict__.items():
+            if isinstance(v, torch.Tensor) and v.shape[0] == batsize:       # probably concatenatable tensor
+                setattr(ret, k, torch_cat_nested(getattr(self, k), getattr(other, k)))
+        # ret.embs = torch_cat_nested(self.embs, other.embs)
+        # ret.layer_ids = torch_cat_nested(self.layer_ids, other.layer_ids)
+        # ret.token_ids = torch_cat_nested(self.token_ids, other.token_ids)
+        # ret.global_bos_eos_mask = torch_cat_nested(self.global_bos_eos_mask, other.global_bos_eos_mask)
+        # ret.global_prompt_mask = torch_cat_nested(self.global_prompt_mask, other.global_prompt_mask)
+        ret.cross_attn_masks = torch_cat_nested(self.cross_attn_masks, other.cross_attn_masks)
+        # ret.progress = torch_cat_nested(self.progress, other.progress)
+        return ret
+    
+    
+class ExtraControlLayer(torch.nn.Module):
+    def __init__(self, out_dim=320, inner_dim=None, **kw):
+        super().__init__(**kw)
+        self.out_dim = out_dim
+        self.inner_dim = (self.out_dim * 4) if inner_dim is None else inner_dim
+        self.ff1 = torch.nn.Conv2d(self.out_dim, self.inner_dim, kernel_size=1)
+        self.ff2 = torch.nn.Conv2d(self.inner_dim, self.out_dim, kernel_size=1)
+        self.nonlin = torch.nn.SiLU()
+        
+    def forward(self, x):
+        y = self.ff1(x)
+        y = self.nonlin(y)
+        y = self.ff2(y)
+        # y = self.nonlin(y)
+        y = y + x
+        return y
+    
+    
+class ExtraControlBlock(torch.nn.Module):
+    def __init__(self, dim, inner_dim=None, text_dim=768, num_layers=3, **kw):
+        super().__init__(**kw)
+        self.dim, self.num_layers = dim, num_layers
+        self.text_dim = text_dim
+        self.inner_dim = (self.dim * 4) if inner_dim is None else inner_dim
+        self.init_block = torch.nn.Conv2d(self.text_dim, self.dim, 1)
+        self.main_block = torch.nn.Sequential(*[
+            ExtraControlLayer(self.dim, inner_dim=self.inner_dim) for i in range(self.num_layers)
+        ])
+        
+    def forward(self, text_hint):
+        y = self.init_block(text_hint.permute(0, 3, 1, 2))
+        y = self.main_block(y)
+        return y
+    
+    
+class ExtendedControlNet(ControlNet):
+    def init_extension(self, num_layers=3):
+        self.text_hint_block = ExtraControlBlock(dim=self.model_channels, num_layers=num_layers)
+    
+    def forward(self, x, hint, timesteps, context, text_hint=None, **kwargs):
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        emb = self.time_embed(t_emb)
+
+        guided_hint = self.input_hint_block(hint, emb, context)
+        guided_text_hint = self.text_hint_block(text_hint)
+
+        outs = []
+
+        h = x.type(self.dtype)
+        for module, zero_conv in zip(self.input_blocks, self.zero_convs):
+            if guided_hint is not None:
+                h = module(h, emb, context)
+                h += guided_hint + guided_text_hint
+                guided_hint, guided_text_hint = None, None
+            else:
+                h = module(h, emb, context)
+            outs.append(zero_conv(h, emb, context))
+
+        h = self.middle_block(h, emb, context)
+        outs.append(self.middle_block_out(h, emb, context))
+
+        return outs
+    
+    
+
 class ControlPWWLDM(ControlLDM):
     first_stage_key = 'image'
     cond_stage_key = 'all'
     control_key = 'cond_image'
     
+    # @torch.no_grad()
+    # def get_input(self, batch, k, bs=None, *args, **kwargs):
+    #     # takes a batch and outputs image x and conditioning info c  --> keep unchanged
+    
+    def set_control_drop(self, p=0.):
+        self.control_drop = p
+    
     def encode_using_text_encoder(self, input_ids):
         outputs = self.cond_stage_model.transformer(input_ids=input_ids, output_hidden_states=self.cond_stage_model.layer=="hidden")
-        if self.cond_stage_model.layer == "last":
-            text_emb = outputs.last_hidden_state
-        elif self.cond_stage_model.layer == "pooled":
-            text_emb = outputs.pooler_output[:, None, :]
-        else:
-            text_emb = outputs.hidden_states[self.layer_idx]
-        return text_emb
+        # if self.cond_stage_model.layer == "last":
+        #     text_emb = outputs.last_hidden_state
+        # elif self.cond_stage_model.layer == "pooled":
+        #     text_emb = outputs.pooler_output[:, None, :]
+        # else:
+        #     text_emb = outputs.hidden_states[self.layer_idx]
+        return outputs.last_hidden_state, outputs.pooler_output
     
-    def get_learned_conditioning(self, c):
-        return self.encode_using_text_encoder(c)
+    def get_learned_conditioning(self, cond):
+        # takes conditioning info (cond_key) and preprocesses it to later be fed into LDM
+        # returns CustomTextConditioning object
+        # called from get_input()
+        # must be used with cond_key = "all", then get_input() passes the batch as-is in here
+        # DONE: unpack texts, embed them, pack back up and package with cross-attention masks
+        
+        with torch.no_grad():
+            pad_token_id, bos_token_id, modelmaxlen = self.cond_stage_model.tokenizer.pad_token_id, self.cond_stage_model.tokenizer.bos_token_id, self.cond_stage_model.tokenizer.model_max_length 
+            device = cond["caption"].device
+            tokenids = cond["caption"]
+            # layerids = cond["layerids"].cpu()
+            encoder_layerids = cond["encoder_layerids"]
+            numlocaldescriptions = encoder_layerids.max()+1
+            assert tokenids.shape[1] == modelmaxlen * numlocaldescriptions
+            tokenids = tokenids.view(tokenids.shape[0], numlocaldescriptions, modelmaxlen)
+            encoder_layerids = encoder_layerids.view(tokenids.shape[0], numlocaldescriptions, modelmaxlen)
+            encoder_layerids = encoder_layerids[:, :, 0]
+            
+            # 2. encode using text encoder
+            input_ids = tokenids.view(-1, tokenids.shape[-1])
+            out_emb, pool_emb = self.encode_using_text_encoder(input_ids)
+            text_emb = out_emb.view(tokenids.shape[0], tokenids.shape[1], out_emb.shape[1], out_emb.shape[2])
+            
+            # 3. extract only the global description
+            global_text_cond = text_emb[:, 0]
+            local_emb = pool_emb.view(tokenids.shape[0], tokenids.shape[1], out_emb.shape[2])
+            
+        maskdim = cond["image"].shape[1] // 8
+        
+        masks = cond["regionmasks"][(maskdim, maskdim)]
+        
+        newshape = tokenids.shape + masks.shape[-2:]
+        masks = masks.view(*newshape)[:, :, 0]
+        
+        _coverage = torch.zeros_like(masks[:, 0])
+        local_index_map = torch.zeros_like(_coverage.long())
+        
+        for i in range(masks.shape[1]):
+            local_index_map.masked_fill_(_coverage < masks[:, i], i)
+            if i > 0:
+                _coverage = torch.max(_coverage, masks[:, i])
+            
+        local_text_cond = torch.zeros(*(local_index_map.shape + (local_emb.shape[-1],)), device=local_emb.device, dtype=local_emb.dtype)
+        for i in range(local_index_map.shape[0]):
+            local_text_cond[i] = local_emb[i][local_index_map[i]]
+        
+        ret = CustomTextConditioning(global_text_cond=global_text_cond,
+                                     local_text_cond=local_text_cond)
+        return ret
     
     
     # def get_learned_conditioning(self, c):
-    #     c = [self.cond_stage_model.tokenizer.decode(c[i], skip_special_tokens=True) for i in range(c.shape[0])]
-    #     if self.cond_stage_forward is None:
-    #         if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
-    #             c = self.cond_stage_model.encode(c)
-    #             if isinstance(c, DiagonalGaussianDistribution):
-    #                 c = c.mode()
-    #         else:
-    #             c = self.cond_stage_model(c)
-    #     else:
-    #         assert hasattr(self.cond_stage_model, self.cond_stage_forward)
-    #         c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
-    #     return c
+    #     return self.encode_using_text_encoder(c)
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
         assert isinstance(cond, dict)
@@ -76,13 +215,14 @@ class ControlPWWLDM(ControlLDM):
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond, control=None, only_mid_control=self.only_mid_control)
         else:  
-            
-            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=torch.cat(cond['c_crossattn'], 1))
+            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, 
+                                         context=cond['c_crossattn'][0].global_text_cond, 
+                                         text_hint=cond['c_crossattn'][0].local_text_cond)
             control = [c * scale for c, scale in zip(control, self.control_scales)]
             if self.global_average_pooling:
                 control = [torch.mean(c, dim=(2, 3), keepdim=True) for c in control]
             
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=torch.cat(cond['c_crossattn'], 1), control=control, only_mid_control=self.only_mid_control)
+            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond['c_crossattn'][0].global_text_cond, control=control, only_mid_control=self.only_mid_control)
         return eps
     
     def get_trainable_parameters(self):
@@ -91,6 +231,8 @@ class ControlPWWLDM(ControlLDM):
         modesplits = self.mode.split("+")
         for paramname, param in self.named_parameters():
             addit = False
+            if paramname.startswith("control_model.text_hint_block"):
+                addit = True
             if "full" in modesplits:
                 if paramname.startswith("control_model"):
                     addit = True
@@ -266,7 +408,10 @@ def create_controlnet_model(basemodelname="v1-5-pruned.ckpt", model_name='contro
     model.__class__ = ControlPWWLDM
     model.first_stage_key = "image"
     model.control_key = "cond_image"
-    model.cond_stage_key = "caption"
+    model.cond_stage_key = "all"
+    
+    model.control_model.__class__ = ExtendedControlNet
+    model.control_model.init_extension(num_layers=4)
     
     model.mode = mode
     
@@ -294,7 +439,7 @@ class TrainMode():
     
     @property
     def use_global_prompt_only(self):
-        return True
+        return False
         
     @property
     def augment_global_caption(self):
@@ -306,7 +451,7 @@ class TrainMode():
         
     @property
     def replace_layerids_with_encoder_layerids(self):
-        return False
+        return True
         
     def addchunk(self, chunk:str):
         self.chunks.append(chunk)
@@ -334,9 +479,9 @@ class TrainMode():
 def main(batsize=5,
          version="v4.2",
          datadir="/USERSPACE/lukovdg1/coco2017/",
-         devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
-         devices=(0,),
-         mode="hint",     # "full", "firstinput", "firsthint", "hint", "hint:firstthree"
+         devexamples="evaldata/extradev1b.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
+         devices=(2,),
+         mode="hint+firstinput",     # "full", "firstinput", "firsthint", "hint"
          numtrain=-1,
          forreal=False,
          seed=12345,        # seed for training
@@ -357,7 +502,7 @@ def main(batsize=5,
     
     expnr = 1
     def get_exp_name(_expnr):
-        ret = f"checkpoints/pretrain-{version}/checkpoints_coco_controlnetmod_{mode}_exp_{_expnr}{'_forreal' if forreal else ''}"
+        ret = f"checkpoints/pretrain-{version}/checkpoints_coco_controlnetmod_extended_{mode}_exp_{_expnr}{'_forreal' if forreal else ''}"
         return ret
         
     exppath = Path(get_exp_name(expnr))

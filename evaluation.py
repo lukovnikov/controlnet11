@@ -283,7 +283,7 @@ def run2(path="coco2017.4dev.examples.pkl"):
     
     
 def run3(
-         path="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_global_v4.2_exp_1/generated_3",
+         path="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1/generated_extradev.pkl_1",
          tightcrop=True,
          fill="none",
          device=0,

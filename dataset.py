@@ -109,8 +109,17 @@ def colorgen_hsv(numhues=36):
             
 def randomcolor_hsv():
     hue = random.uniform(0, 360)
-    sat = random.uniform(0.5, 0.9)
-    val = random.uniform(0.3, 0.7)
+    sat = random.uniform(0.4, 0.9)
+    val = random.uniform(0.2, 0.8)
+    return colorsys.hsv_to_rgb(hue/360, sat, val)
+
+
+predef_hues = list(np.linspace(0, 360, 50))
+predef_vals = list(np.linspace(0, 1, 50))
+def randomcolor_predef():
+    hue = random.choice(predef_hues)
+    val = random.choice(predef_vals)
+    sat = 0.75
     return colorsys.hsv_to_rgb(hue/360, sat, val)
     
     
@@ -610,6 +619,7 @@ class COCOPanopticExample(object):
         
 class COCOPanopticDataset(IterableDataset):
     padlimit=1 #5
+    min_region_area = -1 # 0.002
     
     def __init__(self, maindir:str=None, split="valid", max_masks=10, min_masks=2, max_samples=None, min_size=350,
                  examples=None, mergeregions=True, 
@@ -983,7 +993,9 @@ class COCOPanopticDataset(IterableDataset):
         for i, (region_code, region_info) in enumerate(example.seg_info.items()):
             rgb = torch.tensor(region_code_to_rgb(region_code))
             region_mask = (seg_imgtensor == rgb[:, None, None]).all(0)
-            if self.casmode.name != "global":
+            if (region_mask > 0).sum() / np.prod(region_mask.shape) < self.min_region_area:
+                continue
+            if self.casmode is None or self.casmode.name != "global":
                 region_caption = region_info["caption"]
                 if region_caption in unique_region_captions:
                     if (not self.mergeregions) or (region_caption not in region_caption_to_layerid):
@@ -998,7 +1010,7 @@ class COCOPanopticDataset(IterableDataset):
                 else:
                     pass #continue    # or pass? (if pass, the mask will end up in the conditioning image for controlnet)
             
-            randomcolor = torch.tensor(randomcolor_hsv())
+            randomcolor = torch.tensor(randomcolor_hsv()) #if self.casmode is not None else torch.tensor(randomcolor_predef())
             maskcolor = region_mask.unsqueeze(0).repeat(3, 1, 1) * randomcolor[:, None, None]
         
             cond_imgtensor = torch.where(region_mask.unsqueeze(0) > 0.5, maskcolor, cond_imgtensor)
