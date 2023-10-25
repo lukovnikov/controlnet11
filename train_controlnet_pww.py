@@ -410,7 +410,7 @@ class CustomCrossAttentionDenseDiffusion(CustomCrossAttentionBaseline):
         mpos = sim.max(-1, keepdims=True)[0] - sim
         mneg = sim - sim.min(-1, keepdims=True)[0]
         lambda_t = (1 - context.progress) ** 5
-        lambda_t.masked_fill_(context.progress > 0.3, 0)
+        # lambda_t.masked_fill_(context.progress > 0.3, 0)
         
         boostmask = boostmask[:, None].repeat(1, numheads, 1, 1)
         boostmask = boostmask.view(-1, boostmask.shape[-2], boostmask.shape[-1])
@@ -2300,7 +2300,7 @@ def main(batsize=5,
          devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          #  devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          cas="posattn5a", #"posattn2-opt", #"legacy-NewEdiffipp",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
-         devices=(0,),
+         devices=(1,),
          numtrain=-1,
          regiondrop=-1.,
          controldrop=0.,
@@ -2314,11 +2314,11 @@ def main(batsize=5,
          # generate="",
          generateonly=True,
          threshold=(0., 0.),
-         softness=(3., 0.6),
-         strength=(4., 0.),
+         softness=(1., 0.6),
+         strength=(10., 0.),
         #  threshold=0.0,
-        #  softness=3,
-        #  strength=4,
+        #  softness=0.5,
+        #  strength=1.0,
          limitpadding=False,
          extendedcontrol=False,
         #  loadckpt="",
