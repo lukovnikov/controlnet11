@@ -40,6 +40,27 @@ class OverlayDraw(Draw):
     def _draw(self, canvas, opacity=1.0):
         self.base._draw(canvas, opacity=opacity)
         self.overlay._draw(canvas, opacity=opacity * self.overlay_opacity)
+        
+        
+class DrawLayers(Draw):
+    def __init__(self, *layers:List[Draw], overlay_opacity=1.0, **kw):
+        self.layers = layers
+        basesize = (self.layers[0].get_width(), self.layers[1].get_height())
+        for layer in self.layers:
+            assert basesize == (layer.get_width(), layer.get_height())
+        self.overlay_opacity = overlay_opacity
+        
+    def get_width(self): return self.layers[0].get_width()
+    def get_height(self): return self.layers[0].get_height()
+    
+    def _draw(self, canvas, opacity=1.0):
+        first = True
+        for layer in self.layers:
+            if first:
+                layer._draw(canvas, opacity=opacity)
+                first = False
+            else:
+                layer._draw(canvas, opacity=opacity * self.overlay_opacity)
 
         
 class DrawImage(Draw):
