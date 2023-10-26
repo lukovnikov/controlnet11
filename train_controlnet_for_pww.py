@@ -332,15 +332,15 @@ class TrainMode():
 
 
 def main(batsize=5,
-         version="v4.2",
+         version="v6",
          datadir="/USERSPACE/lukovdg1/coco2017/",
-         devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
+         devexamples="evaldata/extradev.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          devices=(0,),
          mode="hint",     # "full", "firstinput", "firsthint", "hint", "hint:firstthree"
          numtrain=-1,
          forreal=False,
-         seed=12345,        # seed for training
-         log_image_seed=42,     # seed for generating logging images
+         seed=123456,        # seed for training
+         log_image_seed=421,     # seed for generating logging images
          loadckpt="",
          ):  
     args = locals().copy()
@@ -394,7 +394,7 @@ def main(batsize=5,
     batsizes = {384: round(batch_size * 2.4), 448:round(batch_size * 1.4), 512: batch_size}
     print(f"Batch sizes: {batsizes}")
     dl = COCODataLoader(ds, batch_size=batsizes, 
-                        num_workers=max(batsizes.values()) if forreal else 0,
+                        num_workers=max(batsizes.values()),# if forreal else 0,
                         shuffle=True)
 
     model.learning_rate = learning_rate

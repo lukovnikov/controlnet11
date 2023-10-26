@@ -1,0 +1,142 @@
+[
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a pink ball",
+        "<OBJ_B>": "a yellow ball",
+        "<OBJ_C>": "a white ball",
+        "i": 0
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red ball",
+        "<OBJ_B>": "a white ball",
+        "<OBJ_C>": "a pink ball",
+        "i": 1
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a pink ball",
+        "<OBJ_B>": "a blue ball",
+        "<OBJ_C>": "a white ball",
+        "i": 2
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a pink ball",
+        "<OBJ_B>": "a red ball",
+        "<OBJ_C>": "a white ball",
+        "i": 3
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a yellow ball",
+        "<OBJ_B>": "a green ball",
+        "<OBJ_C>": "a pink ball",
+        "i": 4
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a pink ball",
+        "<OBJ_B>": "a blue ball",
+        "<OBJ_C>": "a white ball",
+        "i": 5
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow ball",
+        "<OBJ_B>": "a white ball",
+        "<OBJ_C>": "a red ball",
+        "i": 6
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a white ball",
+        "<OBJ_B>": "a red ball",
+        "<OBJ_C>": "a yellow ball",
+        "i": 7
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a pink ball",
+        "<OBJ_B>": "a red ball",
+        "<OBJ_C>": "a blue ball",
+        "i": 8
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red ball",
+        "<OBJ_B>": "a blue ball",
+        "<OBJ_C>": "a pink ball",
+        "i": 9
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a red ball",
+        "<OBJ_B>": "a white ball",
+        "<OBJ_C>": "a blue ball",
+        "i": 10
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a yellow ball",
+        "<OBJ_B>": "a white ball",
+        "<OBJ_C>": "a pink ball",
+        "i": 11
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red ball",
+        "<OBJ_B>": "a green ball",
+        "<OBJ_C>": "a yellow ball",
+        "i": 12
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a pink ball",
+        "<OBJ_B>": "a white ball",
+        "<OBJ_C>": "a green ball",
+        "i": 13
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow ball",
+        "<OBJ_B>": "a green ball",
+        "<OBJ_C>": "a blue ball",
+        "i": 14
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a green ball",
+        "<OBJ_B>": "a red ball",
+        "<OBJ_C>": "a white ball",
+        "i": 15
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow ball",
+        "<OBJ_B>": "a green ball",
+        "<OBJ_C>": "a red ball",
+        "i": 16
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a green ball",
+        "<OBJ_B>": "a red ball",
+        "<OBJ_C>": "a blue ball",
+        "i": 17
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a pink ball",
+        "<OBJ_B>": "a yellow ball",
+        "<OBJ_C>": "a white ball",
+        "i": 18
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a pink ball",
+        "<OBJ_B>": "a white ball",
+        "<OBJ_C>": "a green ball",
+        "i": 19
+    }
+]

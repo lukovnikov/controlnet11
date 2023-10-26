@@ -1,0 +1,142 @@
+[
+    {
+        "<OBJ_A>": "an apricot",
+        "<OBJ_B>": "a pumpkin",
+        "<OBJ_C>": "an orange",
+        "<OBJ_D>": "a wooden table",
+        "i": 0
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a pumpkin",
+        "<OBJ_B>": "an apricot",
+        "<OBJ_C>": "an orange",
+        "i": 1
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a persimmon",
+        "<OBJ_B>": "an orange",
+        "<OBJ_C>": "an apricot",
+        "i": 2
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "an apricot",
+        "<OBJ_B>": "a persimmon",
+        "<OBJ_C>": "an orange",
+        "i": 3
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a pumpkin",
+        "<OBJ_B>": "an orange",
+        "<OBJ_C>": "an apricot",
+        "i": 4
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "an orange",
+        "<OBJ_B>": "a pumpkin",
+        "<OBJ_C>": "a persimmon",
+        "i": 5
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a persimmon",
+        "<OBJ_B>": "a pumpkin",
+        "<OBJ_C>": "an orange",
+        "i": 6
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "an apricot",
+        "<OBJ_B>": "a pumpkin",
+        "<OBJ_C>": "a persimmon",
+        "i": 7
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "an orange",
+        "<OBJ_B>": "a persimmon",
+        "<OBJ_C>": "an apricot",
+        "i": 8
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a pumpkin",
+        "<OBJ_B>": "an orange",
+        "<OBJ_C>": "a persimmon",
+        "i": 9
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a persimmon",
+        "<OBJ_B>": "an orange",
+        "<OBJ_C>": "a pumpkin",
+        "i": 10
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "an apricot",
+        "<OBJ_B>": "an orange",
+        "<OBJ_C>": "a pumpkin",
+        "i": 11
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "an apricot",
+        "<OBJ_B>": "an orange",
+        "<OBJ_C>": "a persimmon",
+        "i": 12
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a persimmon",
+        "<OBJ_B>": "a pumpkin",
+        "<OBJ_C>": "an apricot",
+        "i": 13
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "an orange",
+        "<OBJ_B>": "a persimmon",
+        "<OBJ_C>": "a pumpkin",
+        "i": 14
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "an orange",
+        "<OBJ_B>": "an apricot",
+        "<OBJ_C>": "a persimmon",
+        "i": 15
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a pumpkin",
+        "<OBJ_B>": "a persimmon",
+        "<OBJ_C>": "an apricot",
+        "i": 16
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "an orange",
+        "<OBJ_B>": "a pumpkin",
+        "<OBJ_C>": "an apricot",
+        "i": 17
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a persimmon",
+        "<OBJ_B>": "an apricot",
+        "<OBJ_C>": "a pumpkin",
+        "i": 18
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "an apricot",
+        "<OBJ_B>": "a persimmon",
+        "<OBJ_C>": "a pumpkin",
+        "i": 19
+    }
+]

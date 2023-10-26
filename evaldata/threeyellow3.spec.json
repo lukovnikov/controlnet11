@@ -1,0 +1,142 @@
+[
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow smiley face pin",
+        "<OBJ_B>": "a dandelion",
+        "<OBJ_C>": "a lemon",
+        "i": 0
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow pancake",
+        "<OBJ_B>": "a gold coin",
+        "<OBJ_C>": "a yellow smiley face pin",
+        "i": 1
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a gold coin",
+        "<OBJ_B>": "a yellow pancake",
+        "<OBJ_C>": "cheese wheel",
+        "i": 2
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow pancake",
+        "<OBJ_B>": "a slice of banana",
+        "<OBJ_C>": "a yellow smiley face pin",
+        "i": 3
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a dandelion",
+        "<OBJ_B>": "cheese wheel",
+        "<OBJ_C>": "a gold coin",
+        "i": 4
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "cheese wheel",
+        "<OBJ_B>": "a lemon",
+        "<OBJ_C>": "a slice of banana",
+        "i": 5
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a dandelion",
+        "<OBJ_B>": "a yellow smiley face pin",
+        "<OBJ_C>": "a gold coin",
+        "i": 6
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "cheese wheel",
+        "<OBJ_B>": "a yellow pancake",
+        "<OBJ_C>": "a lemon",
+        "i": 7
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a dandelion",
+        "<OBJ_B>": "a lemon",
+        "<OBJ_C>": "a yellow smiley face pin",
+        "i": 8
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "cheese wheel",
+        "<OBJ_B>": "a yellow pancake",
+        "<OBJ_C>": "a dandelion",
+        "i": 9
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a gold coin",
+        "<OBJ_B>": "a slice of banana",
+        "<OBJ_C>": "a dandelion",
+        "i": 10
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a gold coin",
+        "<OBJ_B>": "cheese wheel",
+        "<OBJ_C>": "a slice of banana",
+        "i": 11
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow smiley face pin",
+        "<OBJ_B>": "a lemon",
+        "<OBJ_C>": "a yellow pancake",
+        "i": 12
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a lemon",
+        "<OBJ_B>": "a gold coin",
+        "<OBJ_C>": "a yellow smiley face pin",
+        "i": 13
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow pancake",
+        "<OBJ_B>": "a lemon",
+        "<OBJ_C>": "cheese wheel",
+        "i": 14
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a dandelion",
+        "<OBJ_B>": "a slice of banana",
+        "<OBJ_C>": "a yellow smiley face pin",
+        "i": 15
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "cheese wheel",
+        "<OBJ_B>": "a gold coin",
+        "<OBJ_C>": "a yellow smiley face pin",
+        "i": 16
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow smiley face pin",
+        "<OBJ_B>": "cheese wheel",
+        "<OBJ_C>": "a dandelion",
+        "i": 17
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a dandelion",
+        "<OBJ_B>": "a slice of banana",
+        "<OBJ_C>": "a yellow pancake",
+        "i": 18
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a slice of banana",
+        "<OBJ_B>": "a dandelion",
+        "<OBJ_C>": "a lemon",
+        "i": 19
+    }
+]

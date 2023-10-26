@@ -1,0 +1,142 @@
+[
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a peach",
+        "<OBJ_B>": "a watermelon",
+        "<OBJ_C>": "a grape",
+        "i": 0
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a green apple",
+        "<OBJ_B>": "a chestnut",
+        "<OBJ_C>": "a watermelon",
+        "i": 1
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "an orange",
+        "<OBJ_B>": "a kiwi",
+        "<OBJ_C>": "a walnut",
+        "i": 2
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a green apple",
+        "<OBJ_B>": "an orange",
+        "<OBJ_C>": "a grape",
+        "i": 3
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a watermelon",
+        "<OBJ_B>": "a grape",
+        "<OBJ_C>": "a kiwi",
+        "i": 4
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a red apple",
+        "<OBJ_B>": "a green apple",
+        "<OBJ_C>": "a chestnut",
+        "i": 5
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a kiwi",
+        "<OBJ_B>": "a peach",
+        "<OBJ_C>": "a walnut",
+        "i": 6
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a peach",
+        "<OBJ_B>": "a kiwi",
+        "<OBJ_C>": "a chestnut",
+        "i": 7
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a grape",
+        "<OBJ_B>": "a walnut",
+        "<OBJ_C>": "a peach",
+        "i": 8
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a red apple",
+        "<OBJ_B>": "a chestnut",
+        "<OBJ_C>": "a green apple",
+        "i": 9
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a chestnut",
+        "<OBJ_B>": "a watermelon",
+        "<OBJ_C>": "an orange",
+        "i": 10
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a kiwi",
+        "<OBJ_B>": "an orange",
+        "<OBJ_C>": "a green apple",
+        "i": 11
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red apple",
+        "<OBJ_B>": "a walnut",
+        "<OBJ_C>": "a chestnut",
+        "i": 12
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a grape",
+        "<OBJ_B>": "a watermelon",
+        "<OBJ_C>": "a green apple",
+        "i": 13
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "an orange",
+        "<OBJ_B>": "a kiwi",
+        "<OBJ_C>": "a chestnut",
+        "i": 14
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a green apple",
+        "<OBJ_B>": "an orange",
+        "<OBJ_C>": "a grape",
+        "i": 15
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a walnut",
+        "<OBJ_B>": "an orange",
+        "<OBJ_C>": "a grape",
+        "i": 16
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a grape",
+        "<OBJ_B>": "a watermelon",
+        "<OBJ_C>": "a kiwi",
+        "i": 17
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a chestnut",
+        "<OBJ_B>": "a kiwi",
+        "<OBJ_C>": "a walnut",
+        "i": 18
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a watermelon",
+        "<OBJ_B>": "a red apple",
+        "<OBJ_C>": "an orange",
+        "i": 19
+    }
+]

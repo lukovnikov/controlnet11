@@ -1,0 +1,142 @@
+[
+    {
+        "<OBJ_D>": "a fruit basket",
+        "<OBJ_A>": "a green apple",
+        "<OBJ_B>": "a yellow orange",
+        "<OBJ_C>": "a red watermelon",
+        "i": 0
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a yellow apple",
+        "<OBJ_B>": "a red orange",
+        "<OBJ_C>": "a green watermelon",
+        "i": 1
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a red watermelon",
+        "<OBJ_B>": "a green orange",
+        "<OBJ_C>": "a yellow apple",
+        "i": 2
+    },
+    {
+        "<OBJ_D>": "a fruit basket",
+        "<OBJ_A>": "a yellow watermelon",
+        "<OBJ_B>": "a red orange",
+        "<OBJ_C>": "a green apple",
+        "i": 3
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a green orange",
+        "<OBJ_B>": "a yellow apple",
+        "<OBJ_C>": "a red watermelon",
+        "i": 4
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a red apple",
+        "<OBJ_B>": "a yellow orange",
+        "<OBJ_C>": "a green watermelon",
+        "i": 5
+    },
+    {
+        "<OBJ_D>": "a fruit basket",
+        "<OBJ_A>": "a yellow apple",
+        "<OBJ_B>": "a red watermelon",
+        "<OBJ_C>": "a green orange",
+        "i": 6
+    },
+    {
+        "<OBJ_D>": "a fruit basket",
+        "<OBJ_A>": "a red watermelon",
+        "<OBJ_B>": "a green apple",
+        "<OBJ_C>": "a yellow orange",
+        "i": 7
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a red orange",
+        "<OBJ_B>": "a yellow watermelon",
+        "<OBJ_C>": "a green apple",
+        "i": 8
+    },
+    {
+        "<OBJ_D>": "a fruit basket",
+        "<OBJ_A>": "a green watermelon",
+        "<OBJ_B>": "a yellow apple",
+        "<OBJ_C>": "a red orange",
+        "i": 9
+    },
+    {
+        "<OBJ_D>": "a fruit basket",
+        "<OBJ_A>": "a red orange",
+        "<OBJ_B>": "a red apple",
+        "<OBJ_C>": "a green apple",
+        "i": 10
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red apple",
+        "<OBJ_B>": "a yellow apple",
+        "<OBJ_C>": "a yellow watermelon",
+        "i": 11
+    },
+    {
+        "<OBJ_D>": "a fruit basket",
+        "<OBJ_A>": "a green orange",
+        "<OBJ_B>": "a yellow apple",
+        "<OBJ_C>": "a yellow watermelon",
+        "i": 12
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a red apple",
+        "<OBJ_B>": "a green watermelon",
+        "<OBJ_C>": "a yellow watermelon",
+        "i": 13
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red orange",
+        "<OBJ_B>": "a red apple",
+        "<OBJ_C>": "a yellow watermelon",
+        "i": 14
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red orange",
+        "<OBJ_B>": "a red watermelon",
+        "<OBJ_C>": "a green watermelon",
+        "i": 15
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a red orange",
+        "<OBJ_B>": "a green orange",
+        "<OBJ_C>": "a yellow orange",
+        "i": 16
+    },
+    {
+        "<OBJ_D>": "a kitchen table",
+        "<OBJ_A>": "a red apple",
+        "<OBJ_B>": "a green apple",
+        "<OBJ_C>": "a yellow watermelon",
+        "i": 17
+    },
+    {
+        "<OBJ_D>": "a fruit basket",
+        "<OBJ_A>": "a green orange",
+        "<OBJ_B>": "a green apple",
+        "<OBJ_C>": "a yellow watermelon",
+        "i": 18
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red orange",
+        "<OBJ_B>": "a red apple",
+        "<OBJ_C>": "a red watermelon",
+        "i": 19
+    }
+]

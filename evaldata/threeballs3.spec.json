@@ -1,0 +1,142 @@
+[
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red crystal ball",
+        "<OBJ_B>": "a blue ping pong ball",
+        "<OBJ_C>": "a yellow tennis ball",
+        "i": 0
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a blue crystal ball",
+        "<OBJ_B>": "a yellow ping pong ball",
+        "<OBJ_C>": "a red tennis ball",
+        "i": 1
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a blue ping pong ball",
+        "<OBJ_B>": "a yellow tennis ball",
+        "<OBJ_C>": "a red crystal ball",
+        "i": 2
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow ping pong ball",
+        "<OBJ_B>": "a red crystal ball",
+        "<OBJ_C>": "a blue tennis ball",
+        "i": 3
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a yellow tennis ball",
+        "<OBJ_B>": "a blue ping pong ball",
+        "<OBJ_C>": "a red crystal ball",
+        "i": 4
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a blue ping pong ball",
+        "<OBJ_B>": "a red tennis ball",
+        "<OBJ_C>": "a yellow crystal ball",
+        "i": 5
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow tennis ball",
+        "<OBJ_B>": "a red ping pong ball",
+        "<OBJ_C>": "a blue crystal ball",
+        "i": 6
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a yellow tennis ball",
+        "<OBJ_B>": "a blue crystal ball",
+        "<OBJ_C>": "a red ping pong ball",
+        "i": 7
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a blue tennis ball",
+        "<OBJ_B>": "a yellow crystal ball",
+        "<OBJ_C>": "a red ping pong ball",
+        "i": 8
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow tennis ball",
+        "<OBJ_B>": "a blue crystal ball",
+        "<OBJ_C>": "a red ping pong ball",
+        "i": 9
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a red crystal ball",
+        "<OBJ_B>": "a red tennis ball",
+        "<OBJ_C>": "a yellow ping pong ball",
+        "i": 10
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red tennis ball",
+        "<OBJ_B>": "a blue tennis ball",
+        "<OBJ_C>": "a yellow ping pong ball",
+        "i": 11
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a red crystal ball",
+        "<OBJ_B>": "a red ping pong ball",
+        "<OBJ_C>": "a yellow ping pong ball",
+        "i": 12
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red crystal ball",
+        "<OBJ_B>": "a yellow crystal ball",
+        "<OBJ_C>": "a yellow ping pong ball",
+        "i": 13
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a yellow crystal ball",
+        "<OBJ_B>": "a yellow tennis ball",
+        "<OBJ_C>": "a yellow ping pong ball",
+        "i": 14
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red crystal ball",
+        "<OBJ_B>": "a blue crystal ball",
+        "<OBJ_C>": "a blue ping pong ball",
+        "i": 15
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a blue crystal ball",
+        "<OBJ_B>": "a yellow crystal ball",
+        "<OBJ_C>": "a yellow tennis ball",
+        "i": 16
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red crystal ball",
+        "<OBJ_B>": "a red tennis ball",
+        "<OBJ_C>": "a blue ping pong ball",
+        "i": 17
+    },
+    {
+        "<OBJ_D>": "a wooden table",
+        "<OBJ_A>": "a red tennis ball",
+        "<OBJ_B>": "a blue tennis ball",
+        "<OBJ_C>": "a yellow ping pong ball",
+        "i": 18
+    },
+    {
+        "<OBJ_D>": "grass",
+        "<OBJ_A>": "a red tennis ball",
+        "<OBJ_B>": "a blue tennis ball",
+        "<OBJ_C>": "a yellow tennis ball",
+        "i": 19
+    }
+]
