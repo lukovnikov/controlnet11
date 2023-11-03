@@ -13,6 +13,7 @@ import pickle
 import numpy as np
 import tqdm
 
+import fire
 
 
 def load_clip_model(modelname="openai/clip-vit-base-patch32"):
@@ -75,6 +76,22 @@ class MetricScore():
         return str(self)
     
     
+class DictExampleWrapper:
+    def __init__(self, datadict):
+        super().__init__()
+        self._datadict = datadict
+        
+    def load_image(self):
+        return self._datadict["image"]
+    
+    def load_seg_image(self):
+        return self._datadict["seg_img"]
+    
+    @property
+    def captions(self):
+        return [self._datadict["caption"]]
+    
+    
 class LocalCLIPEvaluator():
     LOGITS = MetricScore("localclip_logits")
     COSINE = MetricScore("localclip_cosine")
@@ -85,7 +102,96 @@ class LocalCLIPEvaluator():
         super().__init__()
         self.clipmodel, self.clipprocessor, self.tightcrop, self.fill = clipmodel, clipprocessor, tightcrop, fill
         
+        
     def prepare_example(self, x, tightcrop=None, fill=None):
+        if isinstance(x, DictExampleWrapper):
+            return self.prepare_example_dictwrapper(x, tightcrop=tightcrop, fill=fill)
+        else:
+            return self.prepare_example_controlnet(x, tightcrop=tightcrop, fill=fill)
+        
+    def prepare_example_dictwrapper(self, x, tightcrop=None, fill=None):
+        tightcrop = self.tightcrop if tightcrop is None else tightcrop
+        fill = self.fill if fill is None else fill
+        
+        regionimages = []
+        regiondescriptions = []
+        
+        image = np.array(x.load_image())
+        
+        if "masks" in x._datadict:
+            for mask, regioncaption in zip(x._datadict["masks"], x._datadict["prompts"]):
+                height, width = mask.shape
+            
+                if tightcrop:
+                    bbox_left = np.where(mask > 0)[1].min()
+                    bbox_right = np.where(mask > 0)[1].max()
+                    bbox_top = np.where(mask > 0)[0].min()
+                    bbox_bottom = np.where(mask > 0)[0].max()
+                    
+                    bbox_size = ((bbox_right-bbox_left), (bbox_bottom - bbox_top))
+                    bbox_center = (bbox_left + bbox_size[0] / 2, bbox_top + bbox_size[1] / 2)
+                    
+                    _bbox_size = (max(bbox_size), max(bbox_size))
+                    _bbox_center = (min(max(_bbox_size[0] / 2, bbox_center[0]), width - _bbox_size[0] /2), 
+                                    min(max(_bbox_size[1] / 2, bbox_center[1]), height - _bbox_size[1] /2))
+                    
+                    _image = image[int(_bbox_center[1]-_bbox_size[1]/2):int(_bbox_center[1] + _bbox_size[1]/2),
+                                int(_bbox_center[0]-_bbox_size[0]/2):int(_bbox_center[0] + _bbox_size[0]/2)]
+                    _mask = mask[int(_bbox_center[1]-_bbox_size[1]/2):int(_bbox_center[1] + _bbox_size[1]/2),
+                                int(_bbox_center[0]-_bbox_size[0]/2):int(_bbox_center[0] + _bbox_size[0]/2)]
+                else:
+                    _image = image
+                    _mask = mask
+                
+                if fill in ("none", "") or fill is not None:
+                    regionimage = _image
+                else:
+                    if fill == "black":
+                        fillcolor = np.array([0, 0, 0])
+                    elif fill == "white":
+                        fillcolor = np.array([1, 1, 1]) * 255
+                    else:
+                        avgcolor = np.mean((1 - _mask) * _image, (0, 1))
+                        avgcolor = np.round(avgcolor).astype(np.int32)
+                        fillcolor = avgcolor
+                    regionimage = _image * _mask + fillcolor[None, None, :] * (1 - _mask)
+            
+                regionimages.append(regionimage)
+                regiondescriptions.append(regioncaption)            
+        
+        elif "bboxes" in x._datadict:
+            assert fill in ("none", "") or fill is None
+            height, width, _ = image.shape
+            
+            for bbox, regioncaption in zip(x._datadict["bboxes"], x._datadict["bbox_captions"]):
+                if tightcrop:
+                    bbox_left, bbox_top, bbox_right, bbox_bottom = bbox
+                    bbox_left, bbox_top, bbox_right, bbox_bottom = \
+                        int(bbox_left * width), int(bbox_top * height), int(bbox_right * width), int(bbox_bottom * height)
+                
+                    bbox_size = ((bbox_right-bbox_left), (bbox_bottom - bbox_top))
+                    bbox_center = (bbox_left + bbox_size[0] / 2, bbox_top + bbox_size[1] / 2)
+                    
+                    _bbox_size = (max(bbox_size), max(bbox_size))
+                    _bbox_center = (min(max(_bbox_size[0] / 2, bbox_center[0]), width - _bbox_size[0] /2), 
+                                    min(max(_bbox_size[1] / 2, bbox_center[1]), height - _bbox_size[1] /2))
+                    
+                    _image = image[int(_bbox_center[1]-_bbox_size[1]/2):int(_bbox_center[1] + _bbox_size[1]/2),
+                                int(_bbox_center[0]-_bbox_size[0]/2):int(_bbox_center[0] + _bbox_size[0]/2)]
+                else:
+                    _image = image
+                    
+                regionimage = _image
+                
+                regionimages.append(regionimage)
+                regiondescriptions.append(regioncaption) 
+        
+        else:
+            pass
+            
+        return regionimages, regiondescriptions
+        
+    def prepare_example_controlnet(self, x, tightcrop=None, fill=None):
         tightcrop = self.tightcrop if tightcrop is None else tightcrop
         fill = self.fill if fill is None else fill
         
@@ -256,6 +362,8 @@ class BRISQUEEvaluator():
         
     
 def do_example(x, **evaluators):
+    if isinstance(x, dict):
+        x = DictExampleWrapper(x)
     ret = {}
     for _, evaluator in evaluators.items():
         resultdic = evaluator.run(x)
@@ -282,20 +390,10 @@ def run2(path="coco2017.4dev.examples.pkl"):
     print("done")
     
     
-def run3(
-         path="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1/generated_extradev.pkl_1",
-         tightcrop=True,
-         fill="none",
-         device=0,
-        #  clip_version="openai/clip-vit-base-patch32",
-         clip_version="openai/clip-vit-large-patch14",
-         ):
-    device = torch.device("cuda", device)
-    batchespath = Path(path) / "outbatches.pkl"
+def load_everything(clip_version="openai/clip-vit-large-patch14", device=0, tightcrop=True, fill="none"):
+    print("loading clip model")
     model, processor = load_clip_model(modelname=clip_version)
     model = model.to(device)
-    with open(batchespath, "rb") as f:
-        loadedexamples = pickle.load(f)
         
     print("loading models for evaluation")
     clipevaluator = LocalCLIPEvaluator(model, processor, tightcrop=tightcrop, fill=fill)
@@ -303,8 +401,36 @@ def run3(
     maniqaevaluator = MANIQAEvaluator(device=device)
     brisque = BRISQUEEvaluator(device=device)
     
-    print("model loaded")
+    print("models loaded")
+    # return {
+    #     "clipeval": clipevaluator, 
+    #     "aesthetics": aestheticspredictor, 
+    #     "maniqa": maniqaevaluator, 
+    #     "brisque": brisque,
+    # }
+    return clipevaluator, aestheticspredictor, maniqaevaluator, brisque
+    
+    
+def run3(
+         path="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1/generated_extradev.pkl_1",
+         tightcrop=True,
+         fill="none",
+         device=0,
+        #  clip_version="openai/clip-vit-base-patch32",
+         clip_version="openai/clip-vit-large-patch14",
+         evalmodels=None,
+         ):
+    device = torch.device("cuda", device)
+    batchespath = Path(path) / "outbatches.pkl"
+    
+    with open(batchespath, "rb") as f:
+        loadedexamples = pickle.load(f)
         
+    if evalmodels is None:
+        evalmodels = load_everything(clip_version=clip_version, device=device, tightcrop=tightcrop, fill=fill)
+        
+    clipevaluator, aestheticspredictor, maniqaevaluator, brisque = evalmodels
+    
     colnames = None
     higherbetter = []
     allmetrics = []
@@ -327,6 +453,15 @@ def run3(
                 # example_metrics.append(outputs["brisque"])
                 # batch_metrics.append(tuple(example_metrics))
             allmetrics.append(batch_metrics)        # aggregate over all batches --> (numbats, numseeds, nummetrics)
+    
+    tosave = {"colnames": [str(colname) for colname in colnames],
+              "data": allmetrics}
+    with open(Path(path) / "evaluation_results_raw.json", "w") as f:
+        json.dump(tosave, 
+                  f, 
+                  indent=4)
+    print(f"saved raw results in {Path(path)}")
+            
     allmetrics = np.array(allmetrics)
         
     # compute averages per seed --> (nummetrics, numseeds,)
@@ -359,7 +494,7 @@ def run3(
                 #    "colnames": colnames
              } 
     
-    with open(Path(path) / "evaluation_results.json", "w") as f:
+    with open(Path(path) / "evaluation_results_summary.json", "w") as f:
         json.dump(tosave, 
                   f, 
                   indent=4)
@@ -376,6 +511,60 @@ def tst_aesthetics():
     print("aesthetic score:", score)
     
     
+def run4(
+        paths=[
+            # "/USERSPACE/lukovdg1/DenseDiffusion/gligen_outputs/with_bgr/tau=1.0/*",
+            # "/USERSPACE/lukovdg1/DenseDiffusion/dd_outputs/*",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1/*",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_cac_v5_exp_1/*",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_dd_v5_exp_1/*",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_2/*",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_2/*",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_4/*",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_5/*",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_1/generated_threeorange1.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_2/generated_threeorange1.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_3/generated_threeorange1.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_4/generated_threeorange1.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_5/generated_threeorange1.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_6/generated_threeorange1.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_1/generated_extradev.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_2/generated_extradev.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_3/generated_extradev.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_4/generated_extradev.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_5/generated_extradev.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_6/generated_extradev.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_dd_v5_exp_1/generated_threeorange1.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_dd_v5_exp_2/generated_threeorange1.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_dd_v5_exp_3/generated_threeorange1.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_dd_v5_exp_1/generated_extradev.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_dd_v5_exp_2/generated_extradev.pkl_1",
+            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_dd_v5_exp_3/generated_extradev.pkl_1",
+        ],
+        tightcrop=True,
+        fill="none",
+        device=0,
+        #  clip_version="openai/clip-vit-base-patch32",
+        clip_version="openai/clip-vit-large-patch14",
+        sim=False,
+    ):
+    print("loading everything")
+    if not sim:
+        evalmodels = load_everything(clip_version=clip_version, device=device, tightcrop=tightcrop, fill=fill)
+    
+    totalcount = 0
+    for i, path in enumerate(paths):
+        assert path.startswith("/")
+        subpaths = list(Path("/").glob(path[1:]))
+        for j, subpath in enumerate(subpaths):
+            if subpath.is_dir() and (subpath / "outbatches.pkl").exists():
+                totalcount += 1
+                print(f"Doing {subpath} ({i+1}/{len(paths)} path, {j+1}/{len(subpaths)} subpath) (total: {totalcount})")
+                if not sim:
+                    run3(path=subpath, tightcrop=tightcrop, fill=fill, device=device, clip_version=clip_version, evalmodels=evalmodels)
+                
+    
 if __name__ == "__main__":
     # tst_aesthetics()
-    run3()
+    # run3()
+    fire.Fire(run4)
