@@ -63,6 +63,15 @@ class MetricScore():
         self.name = name
         self.higher_is_better = higher_is_better
         
+    @classmethod
+    def from_string(cls, x):   # must be in format like __str__
+        m = re.match(r"Metric\[([^,]+),(.)\]", x)
+        if m is not None:
+            name, higherbetter = m.groups()
+            return cls(name, higherbetter == "+")
+        else:
+            return None
+        
     def __hash__(self) -> int:
         return hash(self.name)
     
