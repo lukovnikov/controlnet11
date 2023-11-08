@@ -116,7 +116,8 @@ def main(
     print(json.dumps(args, indent=4))     
     print(devices, type(devices), devices[0])
     
-    cas = CASMode(cas)
+    cas = CASMode(cas + "+coco")
+    cas.augment_global_caption = True
     
     # which ckpt to load
     loadckpt = list(expdir.glob(loadckpt))
@@ -138,12 +139,14 @@ def main(
     
     valid_ds = COCOPanopticDataset(maindir=datadir, split="valid", casmode=cas, simpleencode=simpleencode,
                     mergeregions=mergeregions, limitpadding=limitpadding,
-                    max_masks=100, min_masks=1, min_size=128)
+                    max_masks=100, min_masks=1, min_size=128, upscale_to=512)
     
     print(len(valid_ds))
     valid_dl = COCODataLoader(valid_ds, batch_size=batsize, 
                         num_workers=batsize+1,
                         shuffle=False)
+    
+    # batch = next(iter(valid_dl))
         
     imagelogger = ImageLogger(batch_frequency=999, dl=None, seed=seed)
     
@@ -171,24 +174,16 @@ def main(
             allexamples.append(example)
             
     print("total examples:", len(allexamples))
-    outputexamples = []
+    numgen = 1
+    
     for i, example in enumerate(allexamples):
         _examples = [valid_ds.materialize_example(example) for _ in range(numgen)]
         _batch = valid_ds.collate_fn(_examples)
         images = do_log_img(imagelogger, _batch, model)
-        write_image_grid(exppath, images, i, batsize=numgen, rescale=imagelogger.rescale)
-        outputexamples.append([])
-        for image in images["all"]:
-            src_img, seg_img, out_img = image.chunk(3, 1)
-            outexample = deepcopy(example)
-            outexample.image_data = tensor_to_pil(out_img)
-            outexample.seg_data2 = tensor_to_pil(seg_img)
-            outputexamples[-1].append(outexample)
-    
-    with open(exppath / "outbatches.pkl", "wb") as f:
-        pkl.dump(outputexamples, f)
+        for image in images["generated"]:
+            tensor_to_pil(image).save(exppath / f"{i}.png", format="png")
         
-    print(f"saved to file")
+    print(f"done")
             
         
     

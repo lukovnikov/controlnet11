@@ -71,7 +71,9 @@ def main(
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_dd_v4.2_exp_4",
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_posattn4_v4.2_exp_3",
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_posattn5_v4.2_exp_9",
-    expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_posattn5a_v4.2_exp_10",
+    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_posattn5a_v4.2_exp_10",
+    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1",
+    expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_5",
         # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn_v4.1_exp_1",
         # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn_v4.1_exp_3",
         #  expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_global_v4.1_exp_2/",
@@ -84,7 +86,7 @@ def main(
         #  examples="foursquares1.pkl",
         #  examples="evaldata/openair1.pkl",
         # examples="evaldata/threefruits1.pkl,evaldata/foursquares1.pkl,evaldata/openair1.pkl",
-        examples="extradev.examples.pkl,evaldata/threeballs1.pkl,evaldata/threefruits1.pkl,evaldata/foursquares1.pkl,evaldata/openair1.pkl",
+        examples="evaldata/extradev.pkl,evaldata/threeballs1.pkl,evaldata/threefruits1.pkl,evaldata/foursquares1.pkl,evaldata/openair1.pkl",
         #  examples="threeballs.variants.pkl", #"coco2017.4dev.examples.pkl,extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          devices=(2,),
          seed=123456,
@@ -149,7 +151,7 @@ def main(
             loadedexamples = pkl.load(f)
             
         # override pickled defaults
-        valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas +"test", simpleencode=simpleencode, 
+        valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas + "test", simpleencode=simpleencode, 
                                     mergeregions=mergeregions, limitpadding=limitpadding, 
                                     max_masks=28 if limitpadding else 10)
         # valid_dl = COCODataLoader(valid_ds, batch_size=numgen, num_workers=1, shuffle=False, repeatexample=True)

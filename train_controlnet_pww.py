@@ -1968,6 +1968,7 @@ class ControlPWWLDM(ControlLDM):
         log[f"all"] = torch.cat([reconstrimg, controlimg, generated_img], 2)
         del log["reconstruction"]
         del log["control"]
+        log["generated"] = log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"]
         del log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"]
 
         return log
@@ -2233,6 +2234,9 @@ class CASMode():
             if m:
                 self.localonlytil = True
                 self.threshold_lot = float(m.group(1))
+                
+        self._use_global_prompt_only = None
+        self._augment_global_caption = None
         
     @property
     def name(self):
@@ -2240,6 +2244,8 @@ class CASMode():
     
     @property
     def use_global_prompt_only(self):
+        if self._use_global_prompt_only is not None:
+            return self._use_global_prompt_only
         if self.localonlytil:
             return False
         if self.basename.startswith("posattn") or \
@@ -2249,8 +2255,14 @@ class CASMode():
         else:
             return False
         
+    @use_global_prompt_only.setter
+    def use_global_prompt_only(self, val:bool):
+        self._use_global_prompt_only = val
+        
     @property
     def augment_global_caption(self):
+        if self._augment_global_caption is not None:
+            return self._augment_global_caption
         if "keepprompt" in self.chunks or self.is_test:
             return False
         else:
@@ -2258,6 +2270,10 @@ class CASMode():
                 return True
             # TODO
             return True
+        
+    @augment_global_caption.setter
+    def augment_global_caption(self, val:bool):
+        self._augment_global_caption = val
         
     @property
     def is_test(self):
