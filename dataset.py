@@ -621,7 +621,7 @@ class COCOPanopticDataset(IterableDataset):
     padlimit=1 #5
     min_region_area = -1 # 0.002
     
-    def __init__(self, maindir:str=None, split="valid", max_masks=10, min_masks=2, max_samples=None, min_size=350,
+    def __init__(self, maindir:str=None, split="valid", max_masks=10, min_masks=2, max_samples=None, min_size=350, upscale_to=None,
                  examples=None, mergeregions=True, 
                  regiondrop=False,           # if False, dropping examples with too many masks, if True: keeping all examples and dropping randomly some masks, if float: acts like True, but also drops some masks with the given number as drop probability
                  casmode=None, simpleencode=False, limitpadding=False,
@@ -642,6 +642,7 @@ class COCOPanopticDataset(IterableDataset):
         self.max_masks = max_masks
         self.min_masks = min_masks
         self.min_size = min_size
+        self.upscale_to = upscale_to
         self.regiondrop = regiondrop if regiondrop != -1. else False
             
         sizestats = {}
@@ -955,11 +956,18 @@ class COCOPanopticDataset(IterableDataset):
             return (R, G, B)
             
         # materialize one example
-        # 1. load image
+        # 1. load image and segmentation map
         img = example.load_image()   #Image.open(self.image_db[example_id]["path"]).convert("RGB")
-        imgtensor = to_tensor(img)
-        # 2. load segmentation map
         seg_img = example.load_seg_image()   #Image.open(self.panoptic_db[example_id]["segments_map"]).convert("RGB")
+        
+        if self.upscale_to is not None:
+            upscalefactor = self.upscale_to / min(img.size)
+            newsize = [int(s * upscalefactor) for s in img.size]
+            img = img.resize(newsize, resample=Image.BILINEAR)
+            seg_img = seg_img.resize(newsize, resample=Image.BOX)
+            
+        # 2. transform to tensors
+        imgtensor = to_tensor(img)
         seg_imgtensor = torch.tensor(np.array(seg_img)).permute(2, 0, 1)
         
         # 3. create conditioning image by randomly swapping out colors
@@ -971,7 +979,8 @@ class COCOPanopticDataset(IterableDataset):
         # 4. load masks
         masks = [torch.ones_like(imgtensor[0], dtype=torch.bool)]
         # get the captions of the regions and build layer ids
-        region_code_to_layerid = {0: 0}
+        # region_code_to_layerid = {0: 0}
+        region_code_to_layerid = {}
         
         region_caption_to_layerid = {}
         unique_region_captions = set()
