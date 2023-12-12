@@ -459,9 +459,9 @@ class CustomCrossAttentionPosattn(CustomCrossAttentionBaseline):
         # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
         boostmask = mask * mask2        # selects only those tokens not belonging to any regional description
         
-        # expand dimensions to match heads
-        mask = mask[:, None].repeat(1, numheads, 1, 1)
-        mask = mask.view(-1, mask.shape[-2], mask.shape[-1])
+        # # expand dimensions to match heads
+        # mask = mask[:, None].repeat(1, numheads, 1, 1)
+        # mask = mask.view(-1, mask.shape[-2], mask.shape[-1])
         
         a, b = max(0, context.threshold - context.softness / 2), min(context.threshold + context.softness / 2, 1)
         weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
@@ -799,6 +799,11 @@ class CustomCrossAttentionPosattn5a(CustomCrossAttentionPosattn2):  # "a" for ad
         mask2ext = mask2[:, None].repeat(1, numheads, 1, 1)
         mask2ext = mask2ext.view(-1, mask2ext.shape[-2], mask2ext.shape[-1])
         
+        if not isinstance(context.threshold, (list, tuple)):
+            context.threshold = [context.threshold, context.threshold]
+        if not isinstance(context.softness, (list, tuple)):
+            context.softness = [context.softness, context.softness]
+            
         # boostmask should contain only tokens that are local: intersection of "mask" and where layer_ids are nonzero
         a, b = max(0, context.threshold[0] - context.softness[0] / 2), min(context.threshold[0] + context.softness[0] / 2, 1)
         weight = 1 - _threshold_f(context.progress, a, b)[:, None, None]
@@ -2271,6 +2276,10 @@ class CASMode():
             # TODO
             return True
         
+    @property
+    def augment_only(self):
+        return "augmentonly" in self.chunks or "augment_only" in self.chunks
+        
     @augment_global_caption.setter
     def augment_global_caption(self, val:bool):
         self._augment_global_caption = val
@@ -2315,7 +2324,7 @@ def main(batsize=5,
          datadir="/USERSPACE/lukovdg1/coco2017/",
          devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          #  devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
-         cas="posattn5a", #"posattn2-opt", #"legacy-NewEdiffipp",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
+         cas="posattn", #"posattn5a", "posattn2-opt", #"legacy-NewEdiffipp",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
          devices=(1,),
          numtrain=-1,
          regiondrop=-1.,
@@ -2329,12 +2338,12 @@ def main(batsize=5,
         #  generate="alldev",   # ""
          # generate="",
          generateonly=True,
-         threshold=(0., 0.),
-         softness=(1., 0.6),
-         strength=(10., 0.),
-        #  threshold=0.0,
-        #  softness=0.5,
-        #  strength=1.0,
+        #  threshold=(0., 0.),
+        #  softness=(1., 0.6),
+        #  strength=(10., 0.),
+        threshold=0.75,
+        softness=0.,
+        strength=2,
          limitpadding=False,
          extendedcontrol=False,
         #  loadckpt="",

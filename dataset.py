@@ -1034,7 +1034,7 @@ class COCOPanopticDataset(IterableDataset):
         minimize_length = False
         
         if self.casmode.use_global_prompt_only:   # self.casmode in ("posattn-opt", "posattn2-opt"):
-            caption = captions[0]
+            caption = captions[0] if not self.casmode.augment_only else ""
             if self.casmode.augment_global_caption:       # if training, automatically augment sentences
                 tojoin = []
                 for i, capt in enumerate(captions[1:]):
@@ -1063,7 +1063,9 @@ class COCOPanopticDataset(IterableDataset):
              #self.casmode != "global"
              
             if self.casmode.augment_global_caption:
-                captions[0] += ". " + random.choice(extraexpressions) + " " + ", ".join([e for e in captions[1:]]) + "."
+                caption = captions[0] if not self.casmode.augment_only else ""
+                caption += ". " + random.choice(extraexpressions) + " " + ", ".join([e for e in captions[1:]]) + "."
+                captions[0] = caption
              
             for i, caption in enumerate(captions):
                 if i == 0:

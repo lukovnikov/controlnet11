@@ -65,7 +65,11 @@ def do_log_img(imagelogger, batch, pl_module):
 
 
 def main(
-    expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1",
+    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_2",
+    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_2/",
+    expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_2/",
+    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_cac_v5_exp_1",
+    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_dd_v5_exp_1",
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_legacy-NewEdiffipp_v4.2_exp_4",
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_cac_v4.2_exp_1",
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_dd_v4.2_exp_4",
@@ -78,7 +82,7 @@ def main(
         #   expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_bothext2_v4.1_exp_2_forreal/",
          loadckpt="latest*.ckpt",
          datadir="/USERSPACE/lukovdg1/coco2017/",
-         devices=(2,),
+         devices=(0,),
          seed=123456,
          threshold=-1.,
          softness=-1.,
@@ -116,7 +120,7 @@ def main(
     print(json.dumps(args, indent=4))     
     print(devices, type(devices), devices[0])
     
-    cas = CASMode(cas + "+coco")
+    cas = (CASMode(cas) + "coco") + "augmentonly"
     cas.augment_global_caption = True
     
     # which ckpt to load
@@ -180,8 +184,15 @@ def main(
         _examples = [valid_ds.materialize_example(example) for _ in range(numgen)]
         _batch = valid_ds.collate_fn(_examples)
         images = do_log_img(imagelogger, _batch, model)
+        j = 1
         for image in images["generated"]:
-            tensor_to_pil(image).save(exppath / f"{i}.png", format="png")
+            savepath = exppath / f"{example.image_path.stem}_{j}.png"
+            while savepath.exists():
+                k = 1
+                savepath = exppath / f"{example.image_path.stem}_{j}_{k}.png"
+                k += 1
+            tensor_to_pil(image).save(savepath, format="png")
+            j += 1
         
     print(f"done")
             
