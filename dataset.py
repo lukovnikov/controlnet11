@@ -5,7 +5,7 @@ from pathlib import Path
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 import tqdm
 from transformers import CLIPTokenizer
-from torchvision.transforms.functional import to_tensor, to_pil_image
+from torchvision.transforms.functional import to_tensor, to_pil_image, gaussian_blur
 import random
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -14,6 +14,8 @@ import numpy as np
 import colorsys
 from einops import rearrange, repeat
 import re
+from torchvision.transforms.functional import to_tensor, to_pil_image
+import math
 
 
 def _tokenize_annotated_prompt(prompt, tokenizer, minimize_length=False):
@@ -947,6 +949,9 @@ class COCOPanopticDataset(IterableDataset):
                 "regionmasks": batched_regionmasks, 
                 "captiontypes": captiontypes}
         
+    def cond_transform(self, cond_imgtensor, bgr_color=None, **kw):
+        return cond_imgtensor
+        
     def materialize_example(self, example):
         def region_code_to_rgb(rcode):
             B = rcode // 256**2
@@ -971,7 +976,9 @@ class COCOPanopticDataset(IterableDataset):
         seg_imgtensor = torch.tensor(np.array(seg_img)).permute(2, 0, 1)
         
         # 3. create conditioning image by randomly swapping out colors
-        cond_imgtensor = torch.ones_like(imgtensor) * torch.tensor(randomcolor_hsv())[:, None, None]
+        
+        bgr_color = torch.tensor(randomcolor_hsv())
+        cond_imgtensor = torch.ones_like(imgtensor) * bgr_color[:, None, None]
         
         # 4. pick one caption at random (TODO: or generate one from regions)
         captions = [random.choice(example.captions)]
@@ -1024,6 +1031,8 @@ class COCOPanopticDataset(IterableDataset):
         
             cond_imgtensor = torch.where(region_mask.unsqueeze(0) > 0.5, maskcolor, cond_imgtensor)
             
+        cond_imgtensor = self.cond_transform(cond_imgtensor, bgr_color=bgr_color)
+        
         # append extra global prompt
         extraexpressions = ["This image contains", "In this image are", "In this picture are", "This picture contains"]
         # if (self.casmode.name == "doublecross") and not ("keepprompt" in self.casmode.chunks or "test" in self.casmode.chunks):

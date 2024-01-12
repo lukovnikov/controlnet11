@@ -1777,7 +1777,8 @@ class ControlPWWLDM(ControlLDM):
         
         # attach progress to cond["c_crossattn"]        # TODO: check that "t" is a tensor of one value per example in the batch
         cond["c_crossattn"][0].progress = 1 - t / self.num_timesteps
-        cond["c_crossattn"][0].sigma_t = self.sigmas[t].to(t.device)
+        self.sigmas = self.sigmas.to(t.device)
+        cond["c_crossattn"][0].sigma_t = self.sigmas[t]
 
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond, control=None, only_mid_control=self.only_mid_control)
@@ -2320,11 +2321,11 @@ class CASMode():
 
 
 def main(batsize=5,
-         version="v5",
+         version="v1",
          datadir="/USERSPACE/lukovdg1/coco2017/",
          devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
          #  devexamples="extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
-         cas="posattn", #"posattn5a", "posattn2-opt", #"legacy-NewEdiffipp",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
+         cas="global", #"posattn5a", "posattn2-opt", #"legacy-NewEdiffipp",  # "cac", "posattn", "posattn-opt", "both", "local", "global", "bothext", "bothminimal", "doublecross", "sepswitch"
          devices=(1,),
          numtrain=-1,
          regiondrop=-1.,
@@ -2333,7 +2334,7 @@ def main(batsize=5,
          seed=12345,        # seed for training
          log_image_seed=42,     # seed for generating logging images
          freezedown=False,      # don't adapt the down-sampling blocks of the Unet, only change and train the upsamling blocks
-         freezecontrol=False,
+         
          simpleencode=False,    # encode both global and all local prompts as one sequence
         #  generate="alldev",   # ""
          # generate="",
@@ -2376,7 +2377,7 @@ def main(batsize=5,
     
     expnr = 1
     def get_exp_name(_expnr):
-        ret = f"checkpoints/{version}/checkpoints_coco_{cas.name}_{version}_exp_{_expnr}{'_forreal' if forreal else ''}"
+        ret = f"checkpoints_vp/{version}/checkpoints_coco_{cas.name}_{version}_exp_{_expnr}{'_forreal' if forreal else ''}"
         if freezedown:
             ret += "_freezedown"
         if simpleencode:

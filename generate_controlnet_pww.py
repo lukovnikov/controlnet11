@@ -5,17 +5,32 @@ from pathlib import Path
 import pickle as pkl
 import fire
 import os
-from PIL import Image
+from PIL import Image, ImageFilter
 import numpy as np
 
 import torch
 from cldm.logger import ImageLogger, nested_to
 
 from dataset import COCODataLoader, COCOPanopticDataset
+from generate_controlnet_pww_vp import hardblur
 from ldm.util import SeedSwitch, seed_everything
 from train_controlnet_pww import CASMode, create_controlnet_pww_model
 import torchvision
 
+from torchvision.transforms.functional import gaussian_blur
+
+
+class COCOPanopticDatasetTransformed(COCOPanopticDataset):
+    def cond_transform(self, cond_imgtensor, bgr_color=None, cond_blur=None, hard_blur=None):
+        cond_blur = cond_blur if cond_blur is not None else self.cond_blur
+        hard_blur = hard_blur if hard_blur is not None else self.hard_blur
+        if hard_blur > 0:
+            cond_imgtensor = hardblur(cond_imgtensor, radius=hard_blur, bgr_color=bgr_color)
+            
+        if cond_blur > 0:
+            cond_imgtensor = gaussian_blur(cond_imgtensor, kernel_size=cond_blur)
+        return cond_imgtensor
+            
 
 def tensor_to_pil(x, rescale=True):
     if rescale:
@@ -65,35 +80,18 @@ def do_log_img(imagelogger, batch, pl_module):
 
 
 def main(
-    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_global_v4.2_exp_1",
-    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_legacy-NewEdiffipp_v4.2_exp_4",
-    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_cac_v4.2_exp_1",
-    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_dd_v4.2_exp_4",
-    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_posattn4_v4.2_exp_3",
-    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_posattn5_v4.2_exp_9",
-    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_posattn5a_v4.2_exp_10",
-    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1",
-    expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_1",
-        # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn_v4.1_exp_1",
-        # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn_v4.1_exp_3",
-        #  expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_global_v4.1_exp_2/",
-        #   expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_bothext2_v4.1_exp_2_forreal/",
+         expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints_vp/v1/checkpoints_coco_global_v1_exp_1",
          loadckpt="latest*.ckpt",
          numgen=5,
-        #  examples="extradev.examples.pkl",
-        # examples="evaldata/extradev.pkl,evaldata/threeballs1.pkl",
-        #  examples="threefruits1.pkl",
-        #  examples="foursquares1.pkl",
-         examples="evaldata/threeorange1.pkl",
-        # examples="evaldata/threefruits1.pkl,evaldata/foursquares1.pkl,evaldata/openair1.pkl",
-        # examples="evaldata/extradev.pkl,evaldata/threeballs1.pkl,evaldata/threefruits1.pkl,evaldata/foursquares1.pkl,evaldata/openair1.pkl",
-        #  examples="threeballs.variants.pkl", #"coco2017.4dev.examples.pkl,extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
-         devices=(3,),
+         examples="evaldata_vp/clearshapes.pkl",
+         devices=(1,),
          seed=123456,
          threshold=-1.,
          softness=-1.,
          strength=-1.,
          limitpadding=False,
+         condblur=61,           # 31, 61, 101
+         hardblur=20,
          ):    
     localargs = locals().copy()
     expdir = Path(expdir)
@@ -151,18 +149,19 @@ def main(
             loadedexamples = pkl.load(f)
             
         # override pickled defaults
-        valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas + "test", simpleencode=simpleencode, 
+        valid_ds = COCOPanopticDatasetTransformed(examples=loadedexamples, casmode=cas + "test", simpleencode=simpleencode, 
                                     mergeregions=mergeregions, limitpadding=limitpadding, 
-                                    max_masks=28 if limitpadding else 10)
+                                    max_masks=28 if limitpadding else 10, cond_blur=condblur, hard_blur=hardblur)
         # valid_dl = COCODataLoader(valid_ds, batch_size=numgen, num_workers=1, shuffle=False, repeatexample=True)
         
         imagelogger = ImageLogger(batch_frequency=999, dl=None, seed=seed)
         
         i = 1
-        exppath = expdir / f"generated_{Path(devexamplepath).name}_{i}"
+        extraspec = ("" if condblur == 0 else f"_blurred_r{condblur}") + ("" if hardblur == 0 else f"_hardblur_r{hardblur}")
+        exppath = expdir / f"generated_{Path(devexamplepath).name}{extraspec}_{i}"
         while exppath.exists():
             i += 1
-            exppath = expdir / f"generated_{Path(devexamplepath).name}_{i}"
+            exppath = expdir / f"generated_{Path(devexamplepath).name}{extraspec}_{i}"
             
         exppath.mkdir(parents=True, exist_ok=False)
         print(f"logging in {exppath}")
