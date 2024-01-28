@@ -1777,7 +1777,7 @@ class ControlPWWLDM(ControlLDM):
         
         # attach progress to cond["c_crossattn"]        # TODO: check that "t" is a tensor of one value per example in the batch
         cond["c_crossattn"][0].progress = 1 - t / self.num_timesteps
-        cond["c_crossattn"][0].sigma_t = self.sigmas[t].to(t.device)
+        cond["c_crossattn"][0].sigma_t = self.sigmas.to(t.device)[t]
 
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond, control=None, only_mid_control=self.only_mid_control)

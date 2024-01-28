@@ -14,6 +14,7 @@ import numpy as np
 import colorsys
 from einops import rearrange, repeat
 import re
+import cv2 as cv
 
 
 def _tokenize_annotated_prompt(prompt, tokenizer, minimize_length=False):
@@ -625,7 +626,8 @@ class COCOPanopticDataset(IterableDataset):
                  examples=None, mergeregions=True, 
                  regiondrop=False,           # if False, dropping examples with too many masks, if True: keeping all examples and dropping randomly some masks, if float: acts like True, but also drops some masks with the given number as drop probability
                  casmode=None, simpleencode=False, limitpadding=False,
-                 tokenizer_version="openai/clip-vit-large-patch14"):
+                 tokenizer_version="openai/clip-vit-large-patch14",
+                 usescribbles=False, usecanny=False):
         super().__init__()
         assert examples is None or maindir is None      # provide either a directory or a list of already made examples
         self.maindir = maindir
@@ -634,6 +636,9 @@ class COCOPanopticDataset(IterableDataset):
         self.load_tokenizer()
         
         self.casmode = casmode
+        
+        self.usescribbles = usescribbles
+        self.usecanny = usecanny
         
         self.simpleencode = simpleencode
         self.mergeregions = mergeregions
@@ -1121,8 +1126,20 @@ class COCOPanopticDataset(IterableDataset):
                 downmasktensors[res].append(downmask)
         downmasktensors = {k: torch.stack(v, 0) for k, v in downmasktensors.items()}
         
-        # DONE: provide conditioning image based on layers
-        
+        # if usescribbles, transform cond_imgtensor to scribbles
+        if self.usescribbles:
+            cond_imgtensor_np = (np.array(cond_imgtensor.permute(1, 2, 0)) * 255).astype("uint8")
+            canny = cv.Canny(cond_imgtensor_np, 50, 100)
+            scribbleradius = 5      # TODO: check scribble brush size
+            brush = np.zeros((scribbleradius*2+1, scribbleradius*2+1))
+            cv.circle(brush, (scribbleradius, scribbleradius), 0, 1, scribbleradius*2)
+            cond_scribbles = cv.filter2D(src=canny, ddepth=-1, kernel=brush) > 0
+            cond_imgtensor = torch.tensor(cond_scribbles)[None].repeat(3, 1, 1).to(cond_imgtensor.dtype).to(cond_imgtensor.device)
+            
+        if self.usecanny:
+            canny = example.canny_data
+            cond_imgtensor = to_tensor(canny).repeat(3, 1, 1)
+            
         imgtensor = imgtensor * 2 - 1.
         
         return {"image": imgtensor, 

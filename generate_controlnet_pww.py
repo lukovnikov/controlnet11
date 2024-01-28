@@ -73,7 +73,9 @@ def main(
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_posattn5_v4.2_exp_9",
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_posattn5a_v4.2_exp_10",
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1",
-    expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_1",
+    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_1",
+    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1_canny",
+    expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_5_canny",
         # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn_v4.1_exp_1",
         # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn_v4.1_exp_3",
         #  expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_global_v4.1_exp_2/",
@@ -84,7 +86,7 @@ def main(
         # examples="evaldata/extradev.pkl,evaldata/threeballs1.pkl",
         #  examples="threefruits1.pkl",
         #  examples="foursquares1.pkl",
-         examples="evaldata/threeorange1.pkl",
+         examples="evaldata/cannytest.pkl",
         # examples="evaldata/threefruits1.pkl,evaldata/foursquares1.pkl,evaldata/openair1.pkl",
         # examples="evaldata/extradev.pkl,evaldata/threeballs1.pkl,evaldata/threefruits1.pkl,evaldata/foursquares1.pkl,evaldata/openair1.pkl",
         #  examples="threeballs.variants.pkl", #"coco2017.4dev.examples.pkl,extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
@@ -137,10 +139,21 @@ def main(
         raise Exception("multiple matches for loadckpt, unclear")
     else:
         print("ckpt not found, not loading")
+        
+    usescribbles = args["usescribbles"] if "usescribbles" in args else False
+    useedges = args["useedges"] if "useedges" in args else False
+    model_name = "control_v11p_sd15_seg"
+    if usescribbles:
+        assert not useedges
+        assert loadckpt == []
+        model_name = "control_v11p_sd15_scribble"
+    elif useedges:
+        assert loadckpt == []
+        model_name = "control_v11p_sd15_canny"
     
     model = create_controlnet_pww_model(casmode=cas, freezedown=freezedown, simpleencode=simpleencode, 
                                         threshold=threshold, strength=strength, softness=softness, 
-                                        loadckpt=args["loadckpt"])
+                                        loadckpt=args["loadckpt"], model_name=model_name)
     model.limitpadding = args["limitpadding"]
     
     print("model loaded")
@@ -153,7 +166,7 @@ def main(
         # override pickled defaults
         valid_ds = COCOPanopticDataset(examples=loadedexamples, casmode=cas + "test", simpleencode=simpleencode, 
                                     mergeregions=mergeregions, limitpadding=limitpadding, 
-                                    max_masks=28 if limitpadding else 10)
+                                    max_masks=28 if limitpadding else 10, usescribbles=usescribbles, usecanny=useedges)
         # valid_dl = COCODataLoader(valid_ds, batch_size=numgen, num_workers=1, shuffle=False, repeatexample=True)
         
         imagelogger = ImageLogger(batch_frequency=999, dl=None, seed=seed)
