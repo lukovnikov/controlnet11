@@ -43,9 +43,11 @@ class OverlayDraw(Draw):
 
         
 class DrawImage(Draw):
-    def __init__(self, image, imgsize=256, **kw):
+    def __init__(self, image, imgsize=256, rotate=0, **kw):
         super().__init__(**kw)
         self.image = image.convert("RGBA")
+        if rotate != 0:
+            self.image = self.image.rotate(-rotate)
         self.imgsize = (imgsize, imgsize) if isinstance(imgsize, int) else imgsize
         self.width, self.height = self.imgsize
         

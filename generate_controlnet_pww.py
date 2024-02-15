@@ -74,8 +74,8 @@ def main(
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.2/checkpoints_coco_posattn5a_v4.2_exp_10",
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1",
     # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_1",
-    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1_canny",
-    expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_5_canny",
+    # expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1_nocontrol",
+    expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_5",
         # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn_v4.1_exp_1",
         # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_posattn_v4.1_exp_3",
         #  expdir="/USERSPACE/lukovdg1/controlnet11/checkpoints/v4.1/checkpoints_coco_global_v4.1_exp_2/",
@@ -86,7 +86,8 @@ def main(
         # examples="evaldata/extradev.pkl,evaldata/threeballs1.pkl",
         #  examples="threefruits1.pkl",
         #  examples="foursquares1.pkl",
-         examples="evaldata/cannytest.pkl",
+        examples="evaldata/zebra.pkl", # "evaldata/extradev.pkl,evaldata/catdog.pkl",
+        #  examples="evaldata/cannytest.pkl",
         # examples="evaldata/threefruits1.pkl,evaldata/foursquares1.pkl,evaldata/openair1.pkl",
         # examples="evaldata/extradev.pkl,evaldata/threeballs1.pkl,evaldata/threefruits1.pkl,evaldata/foursquares1.pkl,evaldata/openair1.pkl",
         #  examples="threeballs.variants.pkl", #"coco2017.4dev.examples.pkl,extradev.examples.pkl", # "extradev.examples.pkl",  #"coco2017.4dev.examples.pkl",
@@ -120,6 +121,8 @@ def main(
     threshold = args["threshold"]
     softness = args["softness"]
     strength = args["strength"]
+    
+    controlscale = args["controlscale"] if "controlscale" in args else None
     
     seed_everything(seed)
     
@@ -155,6 +158,9 @@ def main(
                                         threshold=threshold, strength=strength, softness=softness, 
                                         loadckpt=args["loadckpt"], model_name=model_name)
     model.limitpadding = args["limitpadding"]
+    
+    if controlscale is not None:
+        model.control_scales = [controlscale for _ in model.control_scales]
     
     print("model loaded")
         

@@ -2115,7 +2115,7 @@ def get_checkpointing_callbacks(interval=6*60*60, dirpath=None):
 
 def create_controlnet_pww_model(basemodelname="v1-5-pruned.ckpt", model_name='control_v11p_sd15_seg', casmode="bothext",
                                 freezedown=False, simpleencode=False, threshold=-1, strength=0., softness=0.,
-                                extendedcontrol=False, loadckpt=""):
+                                extendedcontrol=False, loadckpt="", nocontrol=False):
     # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
     model = create_model(f'./models/{model_name}.yaml').cpu()
     # load main weights

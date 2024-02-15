@@ -39,6 +39,7 @@ share/python-wheels/
 MANIFEST
 
 checkpoints/
+checkpoints_vp/
 pww_outputs/
 coco/
 
