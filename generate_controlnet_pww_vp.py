@@ -10,7 +10,6 @@ import numpy as np
 import random
 
 import torch
-from torch.nn.functional import conv2d
 from cldm.logger import ImageLogger, nested_to
 
 from dataset import COCODataLoader, COCOPanopticDataset, to_tensor, randomcolor_hsv, _tokenize_annotated_prompt, _img_importance_flatten
@@ -18,148 +17,27 @@ from ldm.util import SeedSwitch, seed_everything
 from train_controlnet_pww import CASMode, create_controlnet_pww_model
 import torchvision
 
-from torchvision.transforms.functional import gaussian_blur
-from torch.nn.functional import interpolate
-from perlin_noise import perlin_noise
-
-
-def hardblur(pilimg, radius=5, colors=None, bgr_color=None):    # if colors is None, then we do all of them 
-    # img = to_tensor(pilimg)
-    img = pilimg
-    intimg = (img * 255).to(torch.long)
-    colorcodes = intimg[2] * 256*256 + intimg[1] * 256 + intimg[0]
-    bgrcode = (bgr_color * 255).to(torch.long)
-    bgrcode = bgrcode[0] + bgrcode[1] * 256 + bgrcode[2] * 256*256
-    uniquecolorcodes = set(colorcodes.unique().cpu().numpy()) - {bgrcode.cpu().item()}
-    if colors is None:
-        colors = uniquecolorcodes
-    
-    # create uniform circular kernel
-    kernel = torch.zeros(1, 1, radius * 2 + 1, radius * 2 + 1)
-    for i in range(kernel.shape[2]):
-        for j in range(kernel.shape[3]):
-            x, y = i - radius, j - radius
-            if math.sqrt(x**2 + y**2) <= radius:
-                kernel[:, :, i, j] = 1
-    
-    # generate separate masks for every color
-    colorimgs = []
-    for colorcode in colors:
-        colorimg = (colorcodes == colorcode).float()
-        colorimg = (conv2d(colorimg[None], kernel, padding="same") > 0).float()
-        colorimgs.append(colorimg)
-        
-    # merge masks into overlapping colors
-    normalizer = sum(colorimgs)
-    ret = torch.zeros_like(img)
-    
-    for colorcode, colorimg in zip(colors, colorimgs):
-        rgb_tensor = torch.tensor([colorcode % 256, (colorcode // 256) % 256, colorcode // (256*256) ])
-        ret += colorimg * rgb_tensor[:, None, None]
-    ret /= normalizer
-    
-    ret = torch.where(normalizer > 0, ret, img)
-    ret /= 255
-    
-    return ret
-
-
-def generate_random_precision_map(shape=(512,512), gridsize=2, rescale=1):
-    _shape = tuple([x//rescale for x in shape])
-    noise = perlin_noise(grid_shape=(gridsize, gridsize), out_shape=_shape)
-    noise = (noise - noise.min()) / (noise.max() - noise.min())
-    noise = interpolate(noise[None, None], shape, mode="bilinear")[0, 0]
-    return noise
-
-
-def create_circular_kernel(radius=5):
-    kernel = torch.zeros(1, 1, radius * 2 + 1, radius * 2 + 1)
-    for i in range(kernel.shape[2]):
-        for j in range(kernel.shape[3]):
-            x, y = i - radius, j - radius
-            if math.sqrt(x**2 + y**2) <= radius:
-                kernel[:, :, i, j] = 1
-    return kernel
-
-
-def variable_hardblur(pilimg, 
-                      rmap=32,
-                      gridsize=2,
-                      colors=None, 
-                      bgr_color=torch.tensor([0, 0, 0]), 
-                      device=torch.device("cpu"),
-                      rescale=2,
-                      smoothing=11,
-                      rescale_rmap=8,
-                      rescale_img=2,
-                     ):
-    img = pilimg.to(device)
-    original_shape = img.shape[-2:]
-    
-    if isinstance(rmap, int):
-        _rmap = generate_random_precision_map(gridsize=gridsize, shape=original_shape, rescale=rescale_rmap)
-        rmap = (_rmap * rmap)
-    rmap = rmap.to(device)
-    
-    inner_shape = tuple([x // rescale for x in original_shape])
-    
-    intimg = (img * 255).to(torch.long)
-    colorcodes = intimg[2] * 256*256 + intimg[1] * 256 + intimg[0]
-    bgrcode = (bgr_color * 255).to(torch.long)
-    bgrcode = bgrcode[0] + bgrcode[1] * 256 + bgrcode[2] * 256*256
-    uniquecolorcodes = set(colorcodes.unique().cpu().numpy()) - {bgrcode.cpu().item()}
-    if colors is None:
-        colors = uniquecolorcodes
-        
-    _rmap = (interpolate(rmap[None, None], inner_shape, mode="bilinear")[0, 0] / rescale_img).long()
-    
-    # generate separate masks for every color
-    regionmasks = []
-    for colorcode in colors:
-        current_region_mask = (colorcodes == colorcode).float()                                # (H x W)
-        _current_region_mask = interpolate(current_region_mask[None, None], inner_shape, mode="nearest")[0, 0]
-        kernelsizes = _rmap * _current_region_mask                                               # (H x W)
-        for kernelsize in list(kernelsizes.unique().long().cpu().numpy()):
-            if kernelsize < 1:
-                continue
-            kernelsize_mask = kernelsizes == kernelsize
-            kernel = create_circular_kernel(kernelsize).to(device)
-            _expanded_region_mask = (conv2d(kernelsize_mask[None].float(), kernel, padding="same") > 0)
-            expanded_region_mask = interpolate(_expanded_region_mask[None].float(), original_shape, mode="bicubic")[0]
-            if smoothing > 0:
-                expanded_region_mask = gaussian_blur(expanded_region_mask, smoothing)
-                expanded_region_mask = expanded_region_mask > 0.5
-            expanded_region_mask = expanded_region_mask.bool()
-            current_region_mask = torch.maximum(current_region_mask, expanded_region_mask)
-        regionmasks.append(current_region_mask)
-        
-    # merge masks into overlapping colors
-    normalizer = sum(regionmasks)
-    ret = torch.zeros_like(img).to(device)
-    
-    for colorcode, colorimg in zip(colors, regionmasks):
-        rgb_tensor = torch.tensor([colorcode % 256, (colorcode // 256) % 256, colorcode // (256*256) ]).to(device)
-        ret += colorimg * rgb_tensor[:, None, None]
-    ret /= normalizer
-    
-    ret = torch.where(normalizer > 0, ret, img)
-    ret /= 255
-    
-    return ret
+from blurlib import gaussian_blur, hardblur, variable_hardblur, variable_softblur
 
 
 class COCOPanopticDatasetTransformed(COCOPanopticDataset):
-    def cond_transform(self, cond_imgtensor, bgr_color=None, soft_blur=None, hard_blur=None):
+    def cond_transform(self, cond_imgtensor, bgr_color=None, soft_blur=None, hard_blur=None, var_soft_blur=None, var_hard_blur=None):
         soft_blur = soft_blur if soft_blur is not None else self.soft_blur
         hard_blur = hard_blur if hard_blur is not None else self.hard_blur
+        var_soft_blur = var_soft_blur if var_soft_blur is not None else self.var_soft_blur
+        var_hard_blur = var_hard_blur if var_hard_blur is not None else self.var_hard_blur
+        if var_hard_blur > 0:
+            cond_imgtensor = variable_hardblur(cond_imgtensor, rmap=var_hard_blur, bgr_color=bgr_color)
         if hard_blur > 0:
             cond_imgtensor = hardblur(cond_imgtensor, radius=hard_blur, bgr_color=bgr_color)
             
+        if var_soft_blur > 0:
+            cond_imgtensor = variable_softblur(cond_imgtensor, rmap=var_soft_blur, bgr_color=bgr_color)
         if soft_blur > 0:
             cond_imgtensor = gaussian_blur(cond_imgtensor, kernel_size=soft_blur)
         return cond_imgtensor
     
-    def materialize_example(self, example, soft_blur=None, hard_blur=None):
+    def materialize_example(self, example, soft_blur=None, hard_blur=None, var_soft_blur=None, var_hard_blur=None):
         def region_code_to_rgb(rcode):
             B = rcode // 256**2
             rcode = rcode % 256**2
@@ -239,7 +117,12 @@ class COCOPanopticDatasetTransformed(COCOPanopticDataset):
             cond_imgtensor = torch.where(region_mask.unsqueeze(0) > 0.5, maskcolor, cond_imgtensor)
             
         original_cond_imgtensor = cond_imgtensor
-        cond_imgtensor = self.cond_transform(cond_imgtensor, bgr_color=bgr_color, soft_blur=soft_blur, hard_blur=hard_blur)
+        cond_imgtensor = self.cond_transform(cond_imgtensor, 
+                                             bgr_color=bgr_color, 
+                                             soft_blur=soft_blur, 
+                                             hard_blur=hard_blur,
+                                             var_soft_blur=var_soft_blur,
+                                             var_hard_blur=var_hard_blur)
         
         # append extra global prompt
         extraexpressions = ["This image contains", "In this image are", "In this picture are", "This picture contains"]
@@ -420,8 +303,10 @@ def main(
          softness=-1.,
          strength=-1.,
          limitpadding=False,
-         softblur=61,           # 31, 61, 101
-         hardblur=20,          # 20
+         softblur=0,           # 31, 61, 101
+         hardblur=0,          # 20
+         varsoftblur=61,
+         varhardblur=0,
          ):    
     print(torch.__version__)
     localargs = locals().copy()
@@ -488,7 +373,10 @@ def main(
         imagelogger = ImageLogger(batch_frequency=999, dl=None, seed=seed)
         
         i = 1
-        extraspec = ("" if softblur == 0 else f"_blurred_r{softblur}") + ("" if hardblur == 0 else f"_hardblur_r{hardblur}")
+        extraspec =   ("" if softblur == 0 else f"_softblur_r{softblur}") \
+                    + ("" if hardblur == 0 else f"_hardblur_r{hardblur}")\
+                    + ("" if varsoftblur == 0 else f"_varsoftblur_r{varsoftblur}")\
+                    + ("" if varhardblur == 0 else f"_varhardblur_r{varhardblur}")
         exppath = expdir / f"generated_{Path(devexamplepath).name}{extraspec}_{i}"
         while exppath.exists():
             i += 1
@@ -511,7 +399,11 @@ def main(
         print("total examples:", len(allexamples))
         outputexamples = []
         for i, example in enumerate(allexamples):
-            _examples, _examples_original = zip(*[valid_ds.materialize_example(example, soft_blur=softblur, hard_blur=hardblur) for _ in range(numgen)])
+            _examples, _examples_original = zip(*[valid_ds.materialize_example(example, 
+                                                                               soft_blur=softblur, 
+                                                                               hard_blur=hardblur,
+                                                                               var_soft_blur=varsoftblur,
+                                                                               var_hard_blur=varhardblur) for _ in range(numgen)])
             _batch, _batch_original = valid_ds.collate_fn(_examples), valid_ds.collate_fn(_examples_original)
             seed = random.randint(10000, 100000)
             images = do_log_img(imagelogger, _batch, model, seed=seed)
