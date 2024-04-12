@@ -1029,6 +1029,7 @@ class COCOPanopticDataset(IterableDataset):
         
             cond_imgtensor = torch.where(region_mask.unsqueeze(0) > 0.5, maskcolor, cond_imgtensor)
             
+            
         # append extra global prompt
         extraexpressions = ["This image contains", "In this image are", "In this picture are", "This picture contains"]
         # if (self.casmode.name == "doublecross") and not ("keepprompt" in self.casmode.chunks or "test" in self.casmode.chunks):
