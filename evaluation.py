@@ -6,14 +6,18 @@ from PIL import Image
 import requests
 import torch
 
+from torchvision.transforms.functional import to_tensor
+
 # from cldm.logger import nested_to
 # from dataset import COCOPanopticDataset, COCOPanopticExample, COCODataLoader
 import pickle
 
 import numpy as np
 import tqdm
+import math
 
 import fire
+
 
 
 def load_clip_model(modelname="openai/clip-vit-base-patch32"):
@@ -278,6 +282,543 @@ class LocalCLIPEvaluator():
                 self.PROBS: prob_per_image.diag().mean().detach().cpu().item(),
                 self.ACCURACY: acc_per_image.float().mean().detach().cpu().item()}
 
+LLAVA_MODEL = "llava-hf/llava-v1.6-mistral-7b-hf"
+LLAVA_DEVICE = "cuda:0"
+MISTRAL_MODEL = "mistralai/Mistral-7B-Instruct-v0.2" 
+MISTRAL_DEVICE = "cuda:1"
+
+class LLAVACaptioner:
+    def __init__(self, llavamodel=LLAVA_MODEL, mistralmodel=MISTRAL_MODEL, llavadevice=LLAVA_DEVICE, mistraldevice=MISTRAL_DEVICE, loadedmodels=None):
+        self.mistraldevice = mistraldevice
+        self.llavadevice = llavadevice
+        if loadedmodels is None:
+            loadedmodels = self.loadmodels(llavamodel, mistralmodel, llavadevice, mistraldevice)
+        self.llavaprocessor, self.llavamodel, self.mistralprocessor, self.mistralmodel = loadedmodels
+        
+    def get_loadedmodels(self):
+        return self.llavaprocessor, self.llavamodel, self.mistralprocessor, self.mistralmodel
+        
+    def loadmodels(self, llavamodel, mistralmodel, llavadevice, mistraldevice):
+        from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        if llavamodel is not None:
+            llavaprocessor = LlavaNextProcessor.from_pretrained(llavamodel)
+            llavamodel = LlavaNextForConditionalGeneration.from_pretrained(llavamodel, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map=llavadevice) 
+        else:
+            llavaprocessor, llavamodel = None, None
+        
+        if mistralmodel is not None:
+            mistralprocessor = AutoTokenizer.from_pretrained(mistralmodel)
+            mistralmodel = AutoModelForCausalLM.from_pretrained(mistralmodel, torch_dtype=torch.float16, device_map=mistraldevice)
+        else:
+            mistralprocessor, mistralmodel = None, None
+        
+        return llavaprocessor, llavamodel, mistralprocessor, mistralmodel
+    
+    def text_to_bits(self, text):
+        numvoc = len(self.mistralprocessor.vocab)
+        numbitsperword = math.ceil(math.log(numvoc) / math.log(2))
+        tokens = self.mistralprocessor(text)["input_ids"][1:]
+        bitstr = ""
+        for token in tokens:
+            tokenstr = f"{token:b}"
+            tokenstr = "0"*(numbitsperword - len(tokenstr)) + tokenstr
+            bitstr += tokenstr
+        return bitstr, tokens
+    
+    def bits_to_text(self, bits):
+        numvoc = len(self.mistralprocessor.vocab)
+        numbitsperword = math.ceil(math.log(numvoc) / math.log(2))
+        tokens = []
+        while len(bits) > 0:
+            wordbits = bits[:numbitsperword]
+            tokenid = int(wordbits, 2)
+            tokens.append(tokenid)
+            bits = bits[numbitsperword:]
+        text = self.mistralprocessor.decode([1] + tokens, skip_special_tokens=True)
+        return text
+        
+    def describe_image(self, image, short=False, shortlen=16):
+        if short:
+            prompt = f"[INST] <image> \n Can you please provide a short description of maximum {shortlen} words of the provided image? [/INST]"
+        else:
+            # prompt = f"[INST] <image> \n Fully describe the object in the image in one phrase. [/INST]"
+            prompt = f"[INST] <image> \n What is this object? Fully describe the object in the image in one phrase. [/INST]"
+        processed = self.llavaprocessor(prompt, image, return_tensors="pt").to(self.llavadevice)
+        # print("input: ", prompt)
+        
+        out = self.llavamodel.generate(**processed, max_new_tokens=100, pad_token_id=self.llavaprocessor.eos_token_id)
+
+        output = self.llavaprocessor.decode(out[0], skip_special_tokens=True)
+        # print("output: ", output)
+        
+        splits = output.split("[/INST]")
+        assert( len(splits) == 2)
+        reply = splits[1].strip()
+        return reply
+    
+    def shorten_description(self, text:str, length=14):
+        # how = "a comma-separated list of keywords"
+        how = "a compact headline"
+        # messages = [
+        #     {"role": "user", "content": 
+        #         f"Can you please rephrase the following image description as {how}, with up to {length} words. Provide just one option. Put most important keywords first. Do not put the result in quotes. The image description is as follows: {description}"}
+        # ]
+        messages = [
+            {"role": "user", "content": 
+                f"Gimme a short caption of maximum {length} words from the following image caption. Provide just one option. Do not put the result in quotes. The image caption is as follows: \"{text}\" "}
+        ]
+
+        model_inputs = self.mistralprocessor.apply_chat_template(messages, return_tensors="pt").to(self.mistraldevice)
+
+        generated_ids = self.mistralmodel.generate(model_inputs, max_new_tokens=100, do_sample=True)
+        output = self.mistralprocessor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        splits = output.split("[/INST]")
+        assert( len(splits) == 2)
+        reply = splits[1].strip()
+        
+        # print("Output length: ", len(reply.split()))
+        return reply
+    
+    def reshorten_description(self, text:str, length=14):
+        # how = "a comma-separated list of keywords"
+        how = "a compact headline"
+        # messages = [
+        #     {"role": "user", "content": 
+        #         f"Can you please rephrase the following image description as {how}, with up to {length} words. Provide just one option. Put most important keywords first. Do not put the result in quotes. The image description is as follows: {description}"}
+        # ]
+        messages = [
+            {"role": "user", "content": 
+                f"Can you please make the provided image caption slightly shorter by omitting less important details? Provide just one option. Do not put the result in quotes. The image caption is as follows: \"{description}\" "}
+        ]
+
+        model_inputs = self.mistralprocessor.apply_chat_template(messages, return_tensors="pt").to(self.mistraldevice)
+
+        generated_ids = self.mistralmodel.generate(model_inputs, max_new_tokens=100, do_sample=True)
+        output = self.mistralprocessor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        splits = output.split("[/INST]")
+        assert( len(splits) == 2)
+        reply = splits[1].strip()
+        
+        # print("Output length: ", len(reply.split()))
+        return reply
+    
+    def check_description(self, image, text:str):
+            
+        # extra = "Remember to look at the different objects and their characteristics (such as colors, shapes). "
+        extra = ""
+            
+        # prompt = f"[INST] <image> \n Does the following description describe the content of the provided image well: \"{text}\" . Answer with \"yes\" or \"no\" only. {extra}[/INST]"
+        # prompt = f"[INST] <image> \n Are there any significant differences between the provided image and the following description: \"{text}\"? Answer with \"yes\" or \"no\" only. {extra}[/INST]"
+        # prompt = f"[INST] <image> \n Rate the similarity of the provided image with the following description: \"{text}\" . Answer only with a similarity rating between 1 (=lowest similarity) and 5 (=highest similarity). {extra}[/INST]"
+        # prompt = f"[INST] <image> \n Does the given image match this description: \"{text}\" ? Answer with \"yes\" or \"no\" only.  [/INST]"
+        prompt = f"[INST] <image> \n Is this an image of {text} ? Answer with \"yes\" or \"no\" only.  [/INST]"
+        
+        processed = self.llavaprocessor(prompt, image, return_tensors="pt").to(self.llavadevice)
+        # print("input: ", prompt)
+        
+        out = self.llavamodel.generate(**processed, max_new_tokens=100, pad_token_id=self.llavaprocessor.tokenizer.eos_token_id)
+
+        output = self.llavaprocessor.decode(out[0], skip_special_tokens=True)
+        # print("output: ", output)
+        
+        splits = output.split("[/INST]")
+        assert( len(splits) == 2)
+        reply = splits[1].strip()
+        return reply
+    
+    def choose_description(self, image, choices):
+        choiceletters = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+        # choiceletters = [str(i+1) for i in range(10)]
+        choiceD = {k: v for k, v in zip(range(len(choiceletters)), choiceletters)}
+        revchoiceD = {v: k for k, v in choiceD.items()}
+        assert(len(choiceletters) > len(choices))
+        
+        formattedchoices = zip(choiceletters[:len(choices)], choices)
+        formattedchoices = [f"({l}) {c}" for l, c in formattedchoices]
+        formattedchoices = ", ".join(formattedchoices)
+            
+        # prompt = f"[INST] <image> \n Does the following description describe the content of the provided image well: \"{text}\" . Answer with \"yes\" or \"no\" only. {extra}[/INST]"
+        # prompt = f"[INST] <image> \n Are there any significant differences between the provided image and the following description: \"{text}\"? Answer with \"yes\" or \"no\" only. {extra}[/INST]"
+        # prompt = f"[INST] <image> \n Rate the similarity of the provided image with the following description: \"{text}\" . Answer only with a similarity rating between 1 (=lowest similarity) and 5 (=highest similarity). {extra}[/INST]"
+        # prompt = f"[INST] <image> \n Does the given image match this description: \"{text}\" ? Answer with \"yes\" or \"no\" only.  [/INST]"
+        prompt = f"[INST] <image> \n Which of the following options describes this image best? {formattedchoices}. Reply with a number only. [/INST]"
+        
+        processed = self.llavaprocessor(prompt, image, return_tensors="pt").to(self.llavadevice)
+        # print("input: ", prompt)
+        
+        out = self.llavamodel.generate(**processed, max_new_tokens=100, pad_token_id=self.llavaprocessor.tokenizer.eos_token_id)
+
+        output = self.llavaprocessor.decode(out[0], skip_special_tokens=True)
+        # print("output: ", output)
+        
+        splits = output.split("[/INST]")
+        assert( len(splits) == 2)
+        reply = splits[1].strip()
+        
+        reply = revchoiceD[reply] if reply in revchoiceD else None
+        return reply
+    
+    def check_description_text(self, image=None, text:str=None, imagetext=None):
+        assert text is not None
+        textlen = len(text.split())
+        if image is None:
+            assert imagetext is not None
+        else:
+            assert imagetext is None
+            imagetext = self.describe_image(image, short=True, shortlen=textlen)
+        
+        rating = self.compare_descriptions(imagetext, text)
+        return rating
+    
+    def compare_descriptions(self, textA, textB):
+        messages = [
+            {"role": "user", "content": 
+                f"Are the following two image captions describing the same image or are there things that are different? First caption is \"{textA}\" and the second caption is \"{textB}\". Answer only with a similarity rating between 1 (=lowest similarity) and 5 (=highest similarity)!"}
+        ]
+
+        model_inputs = self.mistralprocessor.apply_chat_template(messages, return_tensors="pt").to(self.mistraldevice)
+
+        generated_ids = self.mistralmodel.generate(model_inputs, max_new_tokens=100, do_sample=True)
+        output = self.mistralprocessor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        splits = output.split("[/INST]")
+        if len(splits) != 2:
+            print(len(splits), output)
+        reply = splits[-1].strip()
+        return reply
+    
+    def describe_and_check(self, imagepath, text:str):
+        if is_url(imagepath):
+            image = Image.open(requests.get(imagepath, stream=True).raw)
+        else:
+            image = Image.open(imagepath)
+            
+        # extra = "Remember to look at the different objects and their characteristics (such as colors, shapes). "
+        extra = ""
+            
+        prompt = f"[INST] <image> \n Check and describe the differences between the provided image and the following image description: {text}. Conclude your reply with \"yes\" or \"no\" whether the provided image matches the provided description. [/INST]"
+        # prompt = f"[INST] <image> \n Are there any significant differences between the provided image and the following description: \"{text}\"? Answer with \"yes\" or \"no\" only. {extra}[/INST]"
+        
+        processed = self.llavaprocessor(prompt, image, return_tensors="pt").to(self.llavadevice)
+        # print("input: ", prompt)
+        
+        out = self.llavamodel.generate(**processed, max_new_tokens=100)
+
+        output = self.llavaprocessor.decode(out[0], skip_special_tokens=True)
+        # print("output: ", output)
+        
+        splits = output.split("[/INST]")
+        assert( len(splits) == 2)
+        reply = splits[1].strip()
+        return reply
+    
+    def explain_difference(self, imagepath, text:str):
+        if is_url(imagepath):
+            image = Image.open(requests.get(imagepath, stream=True).raw)
+        else:
+            image = Image.open(imagepath)
+
+        # extra = "Remember to look at the different objects and their characteristics (such as colors, shapes). "
+        extra = ""            
+        
+        prompt = f"[INST] <image> \n Does the following description describe the provided image well: \"{text}\" . Make a list of things you checked and elaborate. Conclude your reply with a clear \"yes\" or \"no\". {extra} [/INST]"
+        # prompt = f"[INST] <image> \n Are there any significant differences between the provided image and the following description: \"{text}\"? Answer with \"yes\" or \"no\" and make a list of things you checked and elaborate. {extra}[/INST]"
+        
+        processed = self.llavaprocessor(prompt, image, return_tensors="pt").to(self.llavadevice)
+        # print("input: ", prompt)
+        
+        out = self.llavamodel.generate(**processed, max_new_tokens=200)
+
+        output = self.llavaprocessor.decode(out[0], skip_special_tokens=True)
+        # print("output: ", output)
+        
+        splits = output.split("[/INST]")
+        assert( len(splits) == 2)
+        reply = splits[1].strip()
+        return reply
+    
+    def check_description_explain(self, imagepath, text:str):
+        diff = self.explain_difference(imagepath, text)
+        
+        messages = [
+            {"role": "user", "content": 
+                f"Please answer with \"yes\" or \"no\" whether the following paragraph says the image matches the description or not: \"{diff}\". Limit your reply to one word only: either \"Yes\" or \"No\"!"}
+        ]
+
+        model_inputs = self.mistralprocessor.apply_chat_template(messages, return_tensors="pt").to(self.mistraldevice)
+
+        generated_ids = self.mistralmodel.generate(model_inputs, max_new_tokens=100, do_sample=True)
+        output = self.mistralprocessor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        splits = output.split("[/INST]")
+        if len(splits) != 2:
+            print(len(splits), output)
+        reply = splits[-1].strip()
+        return reply, diff
+        
+        
+
+class LLAVAEvaluator():
+    LLAVASCORE = MetricScore("llava_score")
+    
+    def __init__(self, llavadevice=LLAVA_DEVICE, mistraldevice=MISTRAL_DEVICE, tightcrop=True, fill="none"):
+        super().__init__()
+        self.captioner = LLAVACaptioner(llavadevice=llavadevice, mistraldevice=mistraldevice, mistralmodel=None)
+        self.tightcrop, self.fill = tightcrop, fill
+        
+    def prepare_example(self, x, tightcrop=None, fill=None):
+        if isinstance(x, DictExampleWrapper):
+            return self.prepare_example_dictwrapper(x, tightcrop=tightcrop, fill=fill)
+        else:
+            return self.prepare_example_controlnet(x, tightcrop=tightcrop, fill=fill)
+        
+    def seg_image_to_mask_and_bboxes(self, pilimg):
+        img = (to_tensor(pilimg) * 256).long()
+        cimg = img[0] + img[1] * 256 + img[2] * 256 *256
+        masks = []
+        bboxes = []
+        for code in cimg.unique():
+            mask = cimg == code
+            masks.append(mask)
+            masknz = mask.nonzero()
+            bbox = (masknz.min(0)[0], masknz.max(0)[0])
+            bbox = torch.cat(bbox).float()
+            bbox[0], bbox[2] = bbox[0] / img.shape[1], bbox[2] / img.shape[1]
+            bbox[1], bbox[3] = bbox[1] / img.shape[2], bbox[3] / img.shape[2]
+            bbox = torch.stack([bbox[1], bbox[0], bbox[3], bbox[2]])
+            bboxes.append(bbox.numpy())
+        return masks, bboxes
+    
+    def find_closest_mask(self, keybbox, bboxes, masks):
+        closest = None
+        dist = 1e6
+        for bbox, mask in zip(bboxes, masks):
+            d = np.linalg.norm(keybbox - bbox)
+            if d < dist:
+                dist = d
+                closest = (bbox, mask)
+        return closest
+        
+    def prepare_example_dictwrapper(self, x, tightcrop=None, fill=None):
+        tightcrop = self.tightcrop if tightcrop is None else tightcrop
+        fill = self.fill if fill is None else fill
+        
+        regionimages = []
+        regiondescriptions = []
+        
+        image = np.array(x.load_image())
+        
+        if "masks" in x._datadict:
+            for mask, regioncaption in zip(x._datadict["masks"], x._datadict["prompts"]):
+                height, width = mask.shape
+            
+                if tightcrop:
+                    bbox_left = np.where(mask > 0)[1].min()
+                    bbox_right = np.where(mask > 0)[1].max()
+                    bbox_top = np.where(mask > 0)[0].min()
+                    bbox_bottom = np.where(mask > 0)[0].max()
+                    
+                    bbox_size = ((bbox_right-bbox_left), (bbox_bottom - bbox_top))
+                    bbox_center = (bbox_left + bbox_size[0] / 2, bbox_top + bbox_size[1] / 2)
+                    
+                    _bbox_size = (max(bbox_size), max(bbox_size))
+                    _bbox_center = (min(max(_bbox_size[0] / 2, bbox_center[0]), width - _bbox_size[0] /2), 
+                                    min(max(_bbox_size[1] / 2, bbox_center[1]), height - _bbox_size[1] /2))
+                    
+                    _image = image[int(_bbox_center[1]-_bbox_size[1]/2):int(_bbox_center[1] + _bbox_size[1]/2),
+                                int(_bbox_center[0]-_bbox_size[0]/2):int(_bbox_center[0] + _bbox_size[0]/2)]
+                    _mask = mask[int(_bbox_center[1]-_bbox_size[1]/2):int(_bbox_center[1] + _bbox_size[1]/2),
+                                int(_bbox_center[0]-_bbox_size[0]/2):int(_bbox_center[0] + _bbox_size[0]/2)]
+                else:
+                    _image = image
+                    _mask = mask
+                
+                if fill in ("none", "") or fill is None:
+                    regionimage = _image
+                else:
+                    if fill == "black":
+                        fillcolor = np.array([0, 0, 0]).astype(np.uint8)
+                    elif fill == "white":
+                        fillcolor = (np.array([1, 1, 1]) * 255).astype(np.uint8)
+                    else:
+                        avgcolor = np.mean((1 - _mask) * _image, (0, 1))
+                        avgcolor = np.round(avgcolor).astype(np.int32)
+                        fillcolor = avgcolor
+                    regionimage = np.where(_mask[:, :, None] == 1, _image, fillcolor[None, None, :]).astype(np.uint8)
+            
+                regionimages.append(regionimage)
+                regiondescriptions.append(regioncaption)            
+        
+        elif "bboxes" in x._datadict:
+            # assert fill in ("none", "") or fill is None
+            height, width, _ = image.shape
+            seg_masks, seg_bboxes = self.seg_image_to_mask_and_bboxes(x._datadict["seg_img"])
+            
+            for bbox, regioncaption in zip(x._datadict["bboxes"], x._datadict["bbox_captions"]):
+                _, mask = self.find_closest_mask(np.array(bbox), seg_bboxes, seg_masks)
+                if tightcrop:
+                    bbox_left, bbox_top, bbox_right, bbox_bottom = bbox
+                    bbox_left, bbox_top, bbox_right, bbox_bottom = \
+                        int(bbox_left * width), int(bbox_top * height), int(bbox_right * width), int(bbox_bottom * height)
+                
+                    bbox_size = ((bbox_right-bbox_left), (bbox_bottom - bbox_top))
+                    bbox_center = (bbox_left + bbox_size[0] / 2, bbox_top + bbox_size[1] / 2)
+                    
+                    _bbox_size = (max(bbox_size), max(bbox_size))
+                    _bbox_center = (min(max(_bbox_size[0] / 2, bbox_center[0]), width - _bbox_size[0] /2), 
+                                    min(max(_bbox_size[1] / 2, bbox_center[1]), height - _bbox_size[1] /2))
+                    
+                    _image = image[int(_bbox_center[1]-_bbox_size[1]/2):int(_bbox_center[1] + _bbox_size[1]/2),
+                                int(_bbox_center[0]-_bbox_size[0]/2):int(_bbox_center[0] + _bbox_size[0]/2)]
+                    _mask = mask[int(_bbox_center[1]-_bbox_size[1]/2):int(_bbox_center[1] + _bbox_size[1]/2),
+                                int(_bbox_center[0]-_bbox_size[0]/2):int(_bbox_center[0] + _bbox_size[0]/2)]
+                else:
+                    _image = image
+                    _mask = mask
+                      
+                if fill in ("none", "") or fill is None:
+                    regionimage = _image
+                else:
+                    if fill == "black":
+                        fillcolor = np.array([0, 0, 0]).astype(np.uint8)
+                    elif fill == "white":
+                        fillcolor = (np.array([1, 1, 1]) * 255).astype(np.uint8)
+                    else:
+                        avgcolor = np.mean((1 - _mask) * _image, (0, 1))
+                        avgcolor = np.round(avgcolor).astype(np.int32)
+                        fillcolor = avgcolor
+                    regionimage = np.where(_mask[:, :, None] == 1, _image, fillcolor[None, None, :]).astype(np.uint8)
+            
+                
+                regionimages.append(regionimage)
+                regiondescriptions.append(regioncaption) 
+        
+        else:
+            pass
+            
+        return regionimages, regiondescriptions
+        
+    def prepare_example_controlnet(self, x, tightcrop=None, fill=None):
+        tightcrop = self.tightcrop if tightcrop is None else tightcrop
+        fill = self.fill if fill is None else fill
+        
+        regionimages = []
+        regiondescriptions = []
+        
+        image = np.array(x.load_image())
+        seg_image = np.array(x.load_seg_image())
+        seg_image_codes = rgb_to_regioncode(*np.split(seg_image, 3, -1))
+        for regioncode, regioninfo in x.seg_info.items():
+            
+            # extra region caption from global prompt
+            regioncaption = regioninfo["caption"]
+            assert len(x.captions) == 1
+            caption = x.captions[0]
+            matches = re.findall("{([^:]+):" + str(regioncode) + "}", caption)
+            if len(matches) == 0:
+                continue
+            regioncaption = matches[0]
+            
+            mask = (seg_image_codes == regioncode) * 1.
+            height, width, _ = mask.shape
+            
+            if tightcrop:
+                bbox_left = np.where(mask > 0)[1].min()
+                bbox_right = np.where(mask > 0)[1].max()
+                bbox_top = np.where(mask > 0)[0].min()
+                bbox_bottom = np.where(mask > 0)[0].max()
+                
+                bbox_size = ((bbox_right-bbox_left), (bbox_bottom - bbox_top))
+                bbox_center = (bbox_left + bbox_size[0] / 2, bbox_top + bbox_size[1] / 2)
+                
+                _bbox_size = (max(bbox_size), max(bbox_size))
+                _bbox_center = (min(max(_bbox_size[0] / 2, bbox_center[0]), width - _bbox_size[0] /2), 
+                                min(max(_bbox_size[1] / 2, bbox_center[1]), height - _bbox_size[1] /2))
+                
+                _image = image[int(_bbox_center[1]-_bbox_size[1]/2):int(_bbox_center[1] + _bbox_size[1]/2),
+                            int(_bbox_center[0]-_bbox_size[0]/2):int(_bbox_center[0] + _bbox_size[0]/2)]
+                _mask = mask[int(_bbox_center[1]-_bbox_size[1]/2):int(_bbox_center[1] + _bbox_size[1]/2),
+                            int(_bbox_center[0]-_bbox_size[0]/2):int(_bbox_center[0] + _bbox_size[0]/2)]
+            else:
+                _image = image
+                _mask = mask
+            
+            if fill in ("none", "") or fill is None:
+                regionimage = _image
+            else:
+                if fill == "black":
+                    fillcolor = np.array([0, 0, 0]).astype(np.uint8)
+                elif fill == "white":
+                    fillcolor = (np.array([1, 1, 1]) * 255).astype(np.uint8)
+                else:
+                    avgcolor = np.mean((1 - _mask) * _image, (0, 1))
+                    avgcolor = np.round(avgcolor).astype(np.int32)
+                    fillcolor = avgcolor
+                regionimage = np.where(_mask == 1, _image, fillcolor[None, None, :]).astype(np.uint8)
+                  
+            
+            regionimages.append(regionimage)
+            regiondescriptions.append(regioncaption)
+            
+        return regionimages, regiondescriptions
+    
+    def run(self, x):
+        regionimages, regiondescriptions = self.prepare_example(x)
+        metrics = {}
+        
+        llavaout = []
+        for regionimage in regionimages:
+            llavaout.append(self.captioner.choose_description(regionimage, regiondescriptions))
+            
+        multiple_choice_acc = sum([pred == truth for pred, truth in zip(llavaout, range(len(llavaout)))]) / len(llavaout)
+        metrics.update({MetricScore("LLAVA_MULTI_ACC".lower()): multiple_choice_acc})
+        
+        matrix = np.zeros((len(regionimages), len(regiondescriptions)))
+        
+        llavadescriptions = []
+        for i, regionimage in enumerate(regionimages):
+            llavadescriptions.append({})
+            for j, regiondescription in enumerate(regiondescriptions):
+                reply = self.captioner.check_description(regionimage, regiondescription)
+                llavadescriptions[-1][regiondescription] = reply
+                matrix[i, j] = reply_to_bool(reply)
+                
+        metrics.update(compute_llava_scores_from_matrix(matrix))
+        
+            
+        return metrics
+    
+    
+def reply_to_bool(reply):
+    if len(reply.strip()) < 2:
+        return None
+    if reply.strip()[:2].lower().strip() == "no":
+        return False
+    elif reply.strip()[:3].lower().strip() == "yes":
+        return True
+    else:
+        return None
+    
+    
+def compute_llava_scores_from_matrix(m):
+    # accuracy
+    ref = np.eye(m.shape[0], m.shape[1]).astype(m.dtype)
+    acc = (ref == m).sum() / np.prod(m.shape)
+    
+    tp = np.diag(m).sum()
+    fp = m.sum() - tp
+    tn = ((m == ref) & (ref == 0)).sum()
+    fn = (m == 0).sum() - tn
+    
+    precision = tp / (tp + fp)
+    recall = tp / (tp + fn)
+    
+    return {MetricScore("LLAVA_BIN_ACC".lower()): acc, MetricScore("LLAVA_PRECISION".lower()): precision, MetricScore("LLAVA_RECALL".lower()): recall}
+
 
 class AestheticsPredictor():
     SCORE = MetricScore("laion_aest_score")
@@ -370,14 +911,15 @@ class BRISQUEEvaluator():
         return {self.SCORE: score[0].detach().cpu().item()}
         
     
-def do_example(x, **evaluators):
+def do_example(x, evaluators):
     if isinstance(x, dict):
         x = DictExampleWrapper(x)
     ret = {}
-    for _, evaluator in evaluators.items():
-        resultdic = evaluator.run(x)
-        for k, v in resultdic.items():
-            ret[k] = v
+    for evaluator in evaluators:
+        if evaluator is not None:
+            resultdic = evaluator.run(x)
+            for k, v in resultdic.items():
+                ret[k] = v
     return ret
 
     
@@ -400,24 +942,21 @@ def run2(path="coco2017.4dev.examples.pkl"):
     
     
 def load_everything(clip_version="openai/clip-vit-large-patch14", device=0, tightcrop=True, fill="none"):
-    print("loading clip model")
-    model, processor = load_clip_model(modelname=clip_version)
-    model = model.to(device)
+    # print("loading clip model")
+    # model, processor = load_clip_model(modelname=clip_version)
+    # model = model.to(device)
         
     print("loading models for evaluation")
-    clipevaluator = LocalCLIPEvaluator(model, processor, tightcrop=tightcrop, fill=fill)
-    aestheticspredictor = AestheticsPredictor(clip_version, device=device)
-    maniqaevaluator = MANIQAEvaluator(device=device)
-    brisque = BRISQUEEvaluator(device=device)
+    ret = []
+    
+    # ret.append(LocalCLIPEvaluator(model, processor, tightcrop=tightcrop, fill=fill))
+    ret.append(LLAVAEvaluator(tightcrop=tightcrop, fill=fill))
+    # ret.append(AestheticsPredictor(clip_version, device=device))
+    # ret.append(maniqaevaluator = MANIQAEvaluator(device=device))
+    # ret.append(BRISQUEEvaluator(device=device))
     
     print("models loaded")
-    # return {
-    #     "clipeval": clipevaluator, 
-    #     "aesthetics": aestheticspredictor, 
-    #     "maniqa": maniqaevaluator, 
-    #     "brisque": brisque,
-    # }
-    return clipevaluator, aestheticspredictor, maniqaevaluator, brisque
+    return ret
     
     
 def run3(
@@ -428,6 +967,7 @@ def run3(
         #  clip_version="openai/clip-vit-base-patch32",
          clip_version="openai/clip-vit-large-patch14",
          evalmodels=None,
+         save_suffix="llava",
          ):
     device = torch.device("cuda", device)
     batchespath = Path(path) / "outbatches.pkl"
@@ -438,7 +978,7 @@ def run3(
     if evalmodels is None:
         evalmodels = load_everything(clip_version=clip_version, device=device, tightcrop=tightcrop, fill=fill)
         
-    clipevaluator, aestheticspredictor, maniqaevaluator, brisque = evalmodels
+    # clipevaluator, aestheticspredictor, maniqaevaluator, brisque = evalmodels
     
     colnames = None
     higherbetter = []
@@ -449,7 +989,7 @@ def run3(
         for batch in tqdm.tqdm(loadedexamples):
             batch_metrics = []
             for example in batch:       # all examples in one batch have been generated as different seeds of the same starting point
-                outputs = do_example(example, clipevaluator=clipevaluator, aestheticspredictor=aestheticspredictor, maniqa=maniqaevaluator, brisque=brisque)
+                outputs = do_example(example, evalmodels)
                 outputcolnames, outputdata = zip(*sorted(outputs.items(), key=lambda x: x[0].name))
                 if colnames is None:
                     colnames = copy.deepcopy(outputcolnames)
@@ -465,7 +1005,7 @@ def run3(
     
     tosave = {"colnames": [str(colname) for colname in colnames],
               "data": allmetrics}
-    with open(Path(path) / "evaluation_results_raw.json", "w") as f:
+    with open(Path(path) / f"evaluation_results_raw_{save_suffix}.json", "w") as f:
         json.dump(tosave, 
                   f, 
                   indent=4)
@@ -503,7 +1043,7 @@ def run3(
                 #    "colnames": colnames
              } 
     
-    with open(Path(path) / "evaluation_results_summary.json", "w") as f:
+    with open(Path(path) / f"evaluation_results_summary_{save_suffix}.json", "w") as f:
         json.dump(tosave, 
                   f, 
                   indent=4)
@@ -522,7 +1062,7 @@ def tst_aesthetics():
     
 def run4(
         paths=[
-            # "/USERSPACE/lukovdg1/DenseDiffusion/gligen_outputs/with_bgr/tau=1.0/*",
+            "/USERSPACE/lukovdg1/DenseDiffusion/gligen_outputs/with_bgr/tau=1.0/*",
             # "/USERSPACE/lukovdg1/DenseDiffusion/dd_outputs/*",
             # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_global_v5_exp_1/*",
             # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_cac_v5_exp_1/*",
@@ -530,7 +1070,11 @@ def run4(
             # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_2/*",
             # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_2/*",
             # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_4/*",
-            "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_1/*",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_1/*",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_1/generated_threeorange1.pkl_2",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_1/generated_extradev.pkl_1",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_1/generated_catdog.pkl_1",
+            # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_posattn5a_v5_exp_1/generated_zebra.pkl_1",
             # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_1/generated_threeorange1.pkl_1",
             # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_2/generated_threeorange1.pkl_1",
             # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_legacy-NewEdiffipp_v5_exp_3/generated_threeorange1.pkl_1",
@@ -551,18 +1095,20 @@ def run4(
             # "/USERSPACE/lukovdg1/controlnet11/checkpoints/v5/checkpoints_coco_dd_v5_exp_3/generated_extradev.pkl_1",
         ],
         tightcrop=True,
-        fill="none",
+        fill="black",
         device=0,
         #  clip_version="openai/clip-vit-base-patch32",
         clip_version="openai/clip-vit-large-patch14",
         sim=False,
     ):
     print("loading everything")
+    print(paths)
     if not sim:
         evalmodels = load_everything(clip_version=clip_version, device=device, tightcrop=tightcrop, fill=fill)
     
     totalcount = 0
     for i, path in enumerate(paths):
+        print(path)
         assert path.startswith("/")
         subpaths = list(Path("/").glob(path[1:]))
         for j, subpath in enumerate(subpaths):
@@ -570,7 +1116,11 @@ def run4(
                 totalcount += 1
                 print(f"Doing {subpath} ({i+1}/{len(paths)} path, {j+1}/{len(subpaths)} subpath) (total: {totalcount})")
                 if not sim:
+                    # try:
                     run3(path=subpath, tightcrop=tightcrop, fill=fill, device=device, clip_version=clip_version, evalmodels=evalmodels)
+                    # except Exception as e:
+                    #     print("Exception occurred")
+                    #     pass
                 
     
 if __name__ == "__main__":
